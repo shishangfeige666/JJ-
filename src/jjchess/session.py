@@ -95,18 +95,33 @@ class State(str, Enum):
     GAME_OVER = "GAME_OVER"
 
 
-def interruptible_sleep(seconds: float, stop: Callable[[], bool], slice_s: float = 0.05) -> bool:
+def interruptible_sleep(
+    seconds: float,
+    stop: Callable[[], bool],
+    slice_s: float = 0.05,
+    tick: Callable[[], None] | None = None,
+) -> bool:
     """睡 `seconds` 秒，但随时响应 `stop()`。
 
     返回 `True` 表示睡满了，`False` 表示被 `stop()` 打断。
 
-    ⚠️ **不能写成一次 `time.sleep(seconds)`** —— `--human-delay` 最长 2 秒，
-    那样按 F8 / ESC 就要等两秒才有反应（spec 的成功标准 S6 / S7）。
+    `tick` 在每一小片里先跑一次 —— **这是让 F8 / ESC 在拟人延迟期间真正「即时」的关键**。
+    `stop()` 读的是 `_pause_requested` / `should_stop` 两个标志，而设置它们的是主循环里的
+    热键处理（`_handle_hotkeys`），主循环此刻正阻塞在这个函数里面 —— 没人去读键盘，
+    `stop()` 就永远看不到新按键，只能睡满才轮得到热键。真机上按 F8 等了 3.4 秒才暂停
+    （`--human-delay 3-5`，延迟 4.7 秒），就是这么来的。把热键处理挂到 `tick` 上才对得上
+    spec 的成功标准 S7：「延迟期间 F8/ESC 仍即时响应」。
+
+    ⚠️ **不能写成一次 `time.sleep(seconds)`** —— 那样连 `stop()` 都没机会看。
     """
     if seconds <= 0:
+        if tick is not None:
+            tick()
         return not stop()
     deadline = time.monotonic() + seconds
     while True:
+        if tick is not None:
+            tick()
         if stop():
             return False
         remaining = deadline - time.monotonic()
@@ -161,6 +176,9 @@ class SessionDeps:
     geometry_provider: Callable[[], BoardGeometry | None] | None = None
     #: 单调时钟。走子校验要按时间给额度，测试得能把它拨快。
     now: Callable[[], float] = time.monotonic
+    #: 拟人延迟期间每一小片调一次，用来读热键（见 `interruptible_sleep` 的 `tick`）。
+    #: 不给也不会崩 —— 只是延迟期间按 F8/ESC 要等延迟走完才生效。
+    delay_tick: Callable[[], None] | None = None
 
 
 @dataclass
@@ -336,7 +354,11 @@ class Session:
         if delays:
             seconds = random.uniform(*delays)
             self.message = f"THINKING (human delay {seconds:.1f}s)"
-            if not interruptible_sleep(seconds, lambda: self._pause_requested or self.should_stop):
+            if not interruptible_sleep(
+                seconds,
+                lambda: self._pause_requested or self.should_stop,
+                tick=self.deps.delay_tick,
+            ):
                 self.state = State.MY_TURN  # 被打断就不走子，重新决策
                 return
 

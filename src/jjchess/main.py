@@ -488,6 +488,32 @@ def _handle_hotkeys(keys: set[str], session: Session, mouse: Mouse) -> None:
             print("收到退出指令（ESC）")
 
 
+def _handle_delay_hotkeys(keys: set[str], session: Session, mouse: Mouse) -> None:
+    """拟人延迟期间的热键处理：**只理「暂停」和「退出」**。
+
+    这个函数是挂在 `interruptible_sleep` 的 `tick` 上的 —— 主循环那时正阻塞在
+    `session.step()` 里面，只有它能去读键盘（不挂的话按 F8 要等延迟走完才生效，
+    真机实测等了 3.4 秒）。
+
+    为什么不像 `_handle_hotkeys` 那样四个键都理：
+
+    - `F9`（单步）调的是 `session.step_once()`，而这段延迟本来就在 `session.step()`
+      里面 —— 放它进来就是**递归跑状态机**；
+    - `F10` 改的是 `mouse.dry_run`，延迟期间没有点击，改了也不生效，等延迟结束
+      之后下一轮再处理更清楚。
+
+    `pause` 加 `state is not PAUSED` 的守卫：延迟期间状态是 `THINKING`，重复 `pause()`
+    会把 `_state_before_pause` 覆写成 `THINKING`，恢复时回到一个已经过期的状态。
+    """
+    for key in keys:
+        if key == "pause" and session.state is not State.PAUSED:
+            session.pause()
+            print("已暂停（F8 继续）")
+        elif key == "quit":
+            session.request_stop()
+            print("收到退出指令（ESC）")
+
+
 def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     hotkeys = Hotkeys()
     ready = _wait_for_board(args, cfg, window, hotkeys)
@@ -515,6 +541,10 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
         )
     )
     panel = Panel(enabled=not args.no_panel)
+
+    # 拟人延迟期间也要能按 F8 / ESC：主循环那时正阻塞在 `session.step()` 里面，
+    # 没有别的地方会去读键盘。挂在构造之后，是因为回调要引用 `session` 本身。
+    session.deps.delay_tick = lambda: _handle_delay_hotkeys(hotkeys.poll(), session, mouse)
 
     print("开始对局。热键：F8 暂停/继续，F9 单步，F10 彩排，ESC 退出。")
     bad_streak = 0

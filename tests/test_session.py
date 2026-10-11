@@ -124,6 +124,39 @@ def test_睡眠零秒立即返回():
     assert interruptible_sleep(0.0, lambda: flag["v"]) is True
 
 
+def test_睡眠每一小片都会跑一次tick():
+    """`tick` 是让 F8 / ESC 在拟人延迟期间**真正即时**的关键。
+
+    `stop()` 读的是 `_pause_requested` / `should_stop` 两个标志，而设置它们的是
+    主循环里的热键处理 —— 主循环此刻正阻塞在这个函数里，没人去读键盘。
+    不给 `tick` 的话 `stop()` 永远看不到新按键，只能睡满（真机上按 F8 等了 3.4 秒）。
+    """
+    ticks = {"n": 0}
+    ok = interruptible_sleep(0.3, lambda: False, slice_s=0.05, tick=lambda: ticks.__setitem__("n", ticks["n"] + 1))
+    assert ok is True
+    # 0.3 秒切 0.05 秒的片，至少要跑好几次；给个宽松下界，别把实现钉死。
+    assert ticks["n"] >= 5
+
+
+def test_靠tick设置的标志能打断睡眠():
+    """热键处理挂在 `tick` 上时，睡眠必须当片就被打断，而不是等睡满。"""
+    flag = {"v": False}
+
+    def tick() -> None:
+        flag["v"] = True
+
+    t0 = time.monotonic()
+    assert interruptible_sleep(3.0, lambda: flag["v"], slice_s=0.05, tick=tick) is False
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_零秒睡眠也会跑一次tick():
+    """`seconds <= 0` 的短路分支同样要让热键有机会被读到。"""
+    ticks = {"n": 0}
+    assert interruptible_sleep(0.0, lambda: False, tick=lambda: ticks.__setitem__("n", 1)) is True
+    assert ticks["n"] == 1
+
+
 # ============================================================ 会话脚手架
 
 
@@ -183,6 +216,7 @@ def _make_session(
     geom=_FAKE_GEOM,
     my_side: int = RED,
     clock: _Clock | None = None,
+    delay_tick=None,
 ) -> Session:
     deps = SessionDeps(
         board_provider=provider if provider is not None else (lambda: None),
@@ -193,6 +227,7 @@ def _make_session(
         config=config if config is not None else DEFAULTS,
         geometry_provider=(lambda: geom),
         now=clock if clock is not None else time.monotonic,
+        delay_tick=delay_tick,
     )
     s = Session(deps)
     s.board = Board.from_fen(START_FEN)
@@ -720,6 +755,31 @@ def test_人类延迟睡满才走子():
     s = _make_session(State.MY_TURN, provider=p, config=cfg)
     _run_until(s, State.VERIFY)
     assert s.deps.mouse.clicks
+
+
+def test_拟人延迟期间delay_tick会被反复调用并能借它暂停():
+    """主循环就是靠 `delay_tick` 在延迟里读热键的。
+
+    真机实测：`--human-delay 3-5` 那局在延迟中间按 F8，延迟照样睡满 4.7 秒，
+    3.4 秒之后才响应 —— 因为主循环阻塞在 `session.step()` 里，没人去读键盘。
+    """
+    cfg = Config(**{**DEFAULTS.__dict__, "human_delay": (3.0, 3.0)})
+    p = _Provider(Board.from_fen(START_FEN))
+    ticks = {"n": 0}
+
+    def tick() -> None:
+        ticks["n"] += 1
+        if ticks["n"] >= 3:
+            s.pause()  # 模拟「主循环在这一片里读到了 F8」
+
+    s = _make_session(State.MY_TURN, provider=p, config=cfg, delay_tick=tick)
+    s.step()  # -> THINKING
+    t0 = time.monotonic()
+    s.step()  # 思考完进入延迟，第 3 片就被上面那个 tick 打断
+    assert time.monotonic() - t0 < 1.5, "delay_tick 得真的被调用，不能等睡满 3 秒"
+    assert ticks["n"] >= 3
+    assert s.state is State.MY_TURN
+    assert s.deps.mouse.clicks == []
 
 
 def test_延迟消息带秒数():
