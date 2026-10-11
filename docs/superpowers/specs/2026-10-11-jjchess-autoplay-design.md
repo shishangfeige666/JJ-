@@ -45,7 +45,9 @@
 | 兜底方法 | `GetWindowDC` + `BitBlt` → 可得，但**只能拿到屏幕内可见部分** |
 | CPU | Intel i9-14900K，24 核 / 32 线程 |
 | 引擎 | Pikafish **2026-09-06**（universal binary，自动探测 CPU 指令集）<br>`Pikafish.2026-09-06.7z` = 53,603,424 B<br>sha256 `41952bbfe2520faceb5902c69e6ab4845cc999841d2b49a95cc1be7867a25e5b` |
-| 下载通道 | `api.github.com` 返回 **403**（本机有代理 `127.0.0.1:7897`）；但 release CDN 用 `curl -r 0-1023` 返回 **HTTP 206** ✅ 可下 |
+| **引擎已下载并跑通** | `vendor/pikafish/pikafish.exe`（6.94 MB）+ `vendor/pikafish/pikafish.nnue`（50.7 MB）<br>⚠️ **NNUE 权重是独立文件**，必须与 exe 同目录，否则引擎无法加载 |
+| 引擎实测性能 | 开局 `go depth 18`：430 万节点 / **297 ms** = **14.5 Mnps**（16 线程） |
+| 下载通道 | `api.github.com` 返回 **403**（本机有代理 `127.0.0.1:7897`）；release CDN `curl -r 0-1023` 返回 **HTTP 206** ✅ 但**直连仅 ~25 KB/s（需 35 分钟）**<br>镜像 `https://gh-proxy.com/<原始URL>` 实测 **21.6 MB/s**，51 MB **3 秒下完** ✅（配合 sha256 校验，镜像不可信也无妨） |
 | 解压工具 | `bsdtar 3.6.2 - libarchive 3.6.2`（`C:\Windows\System32\tar.exe`），原生支持读 `.7z` ✅ |
 | 阿里 PyPI 镜像 | `https://mirrors.aliyun.com/pypi/simple/` 实测 HTTP 200 ✅ |
 | uv | `0.12.18` |
@@ -232,23 +234,30 @@ class Analysis:
 class UciEngine:
     def __init__(self, exe: Path, threads: int = 8, hash_mb: int = 512, multipv: int = 1): ...
     def __enter__/__exit__        # 进程生命周期
-    def analyse(self, fen: str, movetime_ms: int = 1500) -> Analysis: ...
+    def analyse(self, fen: str, movetime_ms: int = 1200) -> Analysis: ...
     def quit(self) -> None: ...
 ```
 
 - `subprocess.Popen`，`stdin/stdout` 文本管道，行缓冲
 - 握手：`uci` → 等 `uciok`；`setoption name Threads value N`；`setoption name Hash value M`；`isready` → 等 `readyok`
 - 求招：`position fen <fen>` + `go movetime <ms>`；持续读 `info ...` 行保留**最后一条**完整 `info`（含 `depth/score/pv`），读到 `bestmove <m>` 结束
-- **严格校验**：Pikafish 2026 版本对 FEN/UCI 有严格校验，非法输入会打印 `info string CRITICAL ERROR` 并**直接退出进程**。因此送引擎前必须先过 `rules` 合法性检查；wrapper 需捕获进程意外退出并重启引擎
-- 坐标映射（**关键**，见 §5.4）
+- ⚠️ **实现硬约束（实测踩坑得出）**：**绝不能发完 `go` 就发 `quit`**。Pikafish 主线程收到 `quit` 会立即终止正在进行的搜索，导致只搜到 depth 1 就返回垃圾着法（实测 `bestmove a3a4`）。
+  正确做法：**阻塞读 stdout 直到出现 `bestmove` 行**，再从该行取第一个 token（后可能跟 `ponder <move>`，须忽略）
+- **严格校验（实测已确认）**：送非法 FEN（如将帅照面）→ 引擎**直接以 exit code 1 自杀**。因此送引擎前必须先过 `rules` 合法性检查；wrapper 需捕获进程意外退出并重启引擎（最多 3 次）
+- **`EvalFile`**：引擎需同目录的 `pikafish.nnue`。握手后发 `setoption name EvalFile value <abs path>` 更稳妥（默认即按 exe 同目录查找）
+- 坐标映射（**关键**，见 §5.3）
 
 **`tools/fetch_pikafish.py`** —— 引擎获取：
 
 1. `curl -L --retry 5 -C -` 下载 `Pikafish.2026-09-06.7z` 到 `vendor/`
-2. 校验 sha256 = `41952bbf…25e5b`
+   优先走镜像 `https://gh-proxy.com/<原始URL>`（实测 21.6 MB/s）；镜像失败则回退直连
+2. 校验 sha256 = `41952bbfe2520faceb5902c69e6ab4845cc999841d2b49a95cc1be7867a25e5b`
+   （**镜像不可信，但哈希可信** —— 校验通过即保证文件与官方发布完全一致）
 3. `tar.exe -xf` 解压（libarchive 原生读 7z）
-4. 把 `Windows/pikafish.exe`（universal binary）安装到 `vendor/pikafish/pikafish.exe`
-5. 自检：启动引擎发 `uci`，收到 `uciok` 即成功；打印 `id name` 与 `id author`
+4. 安装**两个**文件到 `vendor/pikafish/`：
+   - `Pikafish-Windows-x86-64-universal.exe` → `vendor/pikafish/pikafish.exe`
+   - `pikafish.nnue`（50.7 MB，**必需**）→ `vendor/pikafish/pikafish.nnue`
+5. 自检：启动引擎发 `uci`，收到 `uciok` 即成功；再 `go depth 10` 确认能出 `bestmove`（这一步同时验证 NNUE 加载成功）
 
 **降级**：若引擎文件缺失或握手失败，`engine/fallback.py` 提供一个浅层 α-β（2~3 层 + 子力价值表）保证管线仍可端到端运行与测试；同时在面板上醒目标红"未使用皮卡鱼"。
 
@@ -325,7 +334,7 @@ cur  = 本帧识别结果
 `argparse` CLI：
 
 ```
-uv run jjchess [--side auto|red|black] [--movetime 1500] [--threads 8] [--hash 512]
+uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
 ```
 
@@ -372,6 +381,12 @@ rank = row
 
 > 验证：标准开局黑方视角屏幕 `(row=0, col=0)` 应对应 `i0`（红方右车）。公式给 `file='i'-0='i'`, `rank=0` ⇒ `i0` ✓
 
+> **✅ 已实测验证（`_probe/uci_probe.ps1`）**：构造"一步杀"局面
+> `4k4/R8/9/9/7R1/9/9/9/9/3K5 w - - 0 1`（红帅 d0、红车 a8、红车 h5、黑将 e9）
+> 按本约定预测唯一杀着为 `h5h9`（车 h5→h9 借 a8 车控第 8 横线成杀）
+> → 引擎返回 `info depth 12 ... score mate 1 ... pv h5h9` / `bestmove h5h9` **完全吻合** ✓
+> 同时实测开局 `go depth 18` 返回 `bestmove c3c4`（兵七进一），PV `c3c4 h7e7 h0g2 h9g7 i0h0 i9h9 …` 全部为合法着法格式。
+
 ### 5.4 局面 → 引擎的完整链路
 
 ```
@@ -395,7 +410,7 @@ rank = row
   "window":  { "title_substr": "JJ象棋", "capture_method": "printwindow" },
   "board":   { "roi_y_frac": [0.15, 0.80], "edge_thresh": 60 },
   "vision":  { "roi_scale": 1.30, "template_size": 72, "conf_min": 0.75, "conf_good": 0.90 },
-  "engine":  { "path": "vendor/pikafish/pikafish.exe", "movetime_ms": 1500, "threads": 8, "hash_mb": 512 },
+  "engine":  { "path": "vendor/pikafish/pikafish.exe", "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
   "control": { "jitter_px": 6, "down_up_ms": [60,140], "between_ms": [180,350], "dry_run": false },
   "session": { "side": "auto", "tolerance_cells": 1, "stable_frames": 2, "endgame_idle_s": 12 }
 }
@@ -484,11 +499,13 @@ default = true
 | 窗口被拖动 / 小程序尺寸变化 | 每帧校验 hwnd 与客户区尺寸；变化则重新定位棋盘 |
 | 棋子选中高亮、走子动画导致误识别 | 只取盘心区 + CLAHE 归一化；动画期等待画面稳定（连续 2 帧一致）才识别 |
 | 单格识别错误导致非法局面 | 合法着法解释器自动纠正；送引擎前 `sanity_check` |
-| 皮卡鱼严格校验导致进程自杀 | 先校验后发送；wrapper 检测进程退出并自动重启（最多 3 次） |
+| 皮卡鱼严格校验导致进程自杀 | 先校验后发送；wrapper 检测进程退出并自动重启（最多 3 次）。**已实测确认**：非法 FEN → exit code 1 |
+| 引擎缺少 NNUE 权重无法加载 | `pikafish.nnue`（50.7 MB）与 exe 必须同目录；`fetch_pikafish.py` 安装**两个**文件；自检用 `go depth 10` 确认能出 `bestmove` |
+| UCI 读取时序错误导致只搜到 depth 1 | **发完 `go` 不可立即 `quit`**；必须阻塞读到 `bestmove` 行 |
+| 皮卡鱼下载失败（GitHub 403 / 直连仅 25 KB/s 需 35 分钟） | 优先镜像 `gh-proxy.com`（实测 21.6 MB/s，3 秒完成）；`curl --retry 5 -C -` 断点续传；**sha256 强校验**保证镜像内容与官方一致；失败时降级到浅层 α-β 并在面板标红 |
 | 点击落空 / 被弹窗拦截 | 点击后局面复检；重试 1 次；仍失败熔断为 PAUSED |
 | 鼠标被抢占 / 误操作 | `F8` 即时暂停；`--dry-run` 全程不点击 |
-| 皮卡鱼下载失败（GitHub 403 风险） | `curl --retry 5 -C -` 断点续传；sha256 校验；失败时降级到浅层 α-β 并在面板标红 |
-| 窗口顶部 279px 在屏外 | 抓图不受影响；启动时校验棋盘是否完全在屏幕内，否则提示移动窗口 |
+| 窗口顶部 279px 在屏外 | 抓图不受影响（`PW_RENDERFULLCONTENT` 已实测可拿到屏外部分）；启动时校验棋盘是否完全在屏幕内，否则提示移动窗口 |
 
 ---
 
@@ -496,5 +513,6 @@ default = true
 
 1. 模块划分与目录结构是否认可
 2. 识别方案（模板匹配 + 合法着法解释器纠错）是否认可 —— 相比"训练 CNN 分类"更轻量、可解释、无需标注数据
-3. 思考时间默认 1500ms（可 `--movetime` 调整）是否合适；对局总时长 30 分钟
+3. 思考时间默认 **1200ms**（可 `--movetime` 调整）是否合适 —— 实测本机 **14.5 Mnps**（16 线程），1200ms 可搜到 depth 20+，远超人类；对局总时长 30 分钟，按 60 步估算共耗约 72 秒，余量充足
 4. 是否需要"记谱导出"（把整局走法存成中文记谱 txt）—— 目前列为可选，默认关闭
+5. 是否需要"拟人化思考延迟"（在引擎结果外再加 0.5~2s 随机停顿，避免每步都秒回、显得像脚本）—— 目前未纳入，倾向加为 `--human-delay` 可选开关
