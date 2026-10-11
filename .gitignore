@@ -6,6 +6,8 @@ __pycache__/
 # 运行时生成物（由 tools/calibrate.py 产出）
 config/calibration.json
 config/templates.npz
+config/templates_preview.png
+config/recognition_preview.png
 # 引擎二进制（由 tools/fetch_pikafish.py 下载）
 vendor/
 # 调试截图
@@ -14,3 +16,5 @@ debug/
 records/
 # 临时探针脚本与日志
 _probe/
+# tools/record_frames.py --watch 的滚动产物（挑出有用的再改名提交）
+tests/fixtures/mid_*.png

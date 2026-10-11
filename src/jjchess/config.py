@@ -28,8 +28,8 @@ class Config:
     movetime_ms: int = 1200
     threads: int = 8
     hash_mb: int = 512
-    conf_min: float = 0.75
-    conf_good: float = 0.90
+    conf_min: float = 0.60
+    conf_good: float = 0.75
     tolerance_cells: int = 1
     human_delay: tuple[float, float] | None = None
     gameover_idle_sec: float = 12.0

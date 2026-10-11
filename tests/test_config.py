@@ -51,8 +51,8 @@ def test_默认配置文件本身可解析():
     assert cfg.movetime_ms == 1200
     assert cfg.threads == 8
     assert cfg.hash_mb == 512
-    assert cfg.conf_min == 0.75
-    assert cfg.conf_good == 0.90
+    assert cfg.conf_min == 0.60
+    assert cfg.conf_good == 0.75
     assert cfg.tolerance_cells == 1
     assert cfg.gameover_idle_sec == 12.0
     assert cfg.human_delay is None  # 文件里 enabled=false
