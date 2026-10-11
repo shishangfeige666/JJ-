@@ -89,6 +89,18 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ("检测到开局局面", "opening position detected"),
     ("走子已确认", "move confirmed"),
     (
+        "看到一盘下到一半的棋，先看看轮到谁",
+        "mid-game found, watching whose turn",
+    ),
+    (
+        "画面动了，对方刚落子，接手这一局",
+        "board moved: opponent just played, taking over",
+    ),
+    (
+        "盯了一会儿没人动，当我方走，接手这一局",
+        "nobody moved: assuming our turn, taking over",
+    ),
+    (
         "这一步好像没点上，重按一次（第",
         "click did not register, retrying #",
     ),
@@ -97,6 +109,9 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ("走 ", "played "),
     ("继续", "RESUMED"),
     (" 次）", ")"),
+    # 放在最后：前面那些**整条**消息里带省略号的条目要先生效，
+    # 否则「等待对局开始…」会被先折成 ASCII 点，就再也匹配不上了。
+    ("…", "..."),
 )
 
 

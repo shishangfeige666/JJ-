@@ -52,6 +52,8 @@ __all__ = [
     "BOARD_LOST_TIMEOUT_S",
     "CLICK_RETRIES",
     "MAX_UNEXPLAINED",
+    "MIDGAME_PROBE_S",
+    "MIN_MIDGAME_PIECES",
     "VERIFY_TIMEOUT_S",
     "Session",
     "SessionDeps",
@@ -81,6 +83,15 @@ VERIFY_TIMEOUT_S = 5.0
 #: 重按是**安全**的：只有画面完完全全等于走子之前才重按（见 `_retry_click`），
 #: 所以重按的是同一着、同一个起点，不可能把棋下歪。
 CLICK_RETRIES = 2
+#: 脚本启动时窗口里**已经有一盘下到一半的棋**，先盯住看多久再决定轮到谁（秒）。
+#:
+#: 「中盘接手」只能靠**动没动**来判断：对方的回合画面迟早会变（他走子），
+#: 我方的回合不会变。盯 `MIDGAME_PROBE_S` 秒还纹丝不动，就当我方走。
+#: 代价是接手时晚 5 秒落子；反过来若对方这 5 秒里一直在想棋，我方也只是
+#: 白等这 5 秒，无害。真正要防的是「明明轮到我方却一直不落子」，所以宁可盯短点。
+MIDGAME_PROBE_S = 5.0
+#: 中盘局面至少要有这么多子才敢接手（「正在匹配」那块装饰棋盘是空的）。
+MIN_MIDGAME_PIECES = 4
 #: 棋盘「读不到」多久就判定对局结束（秒）。
 #:
 #: 真机实测：我方用双車做成绝杀之后，游戏立刻切到结算画面（大红的「再来一局」），
@@ -217,6 +228,11 @@ class Session:
     _pending_move: str | None = None
     _board_before: Board | None = None
     _think_ms: int | None = None
+    #: 这一步已经重按了几次（见 `_retry_click`）。
+    _click_retries: int = 0
+    #: 「中盘接手」的观察期：见 `_step_idle` / `MIDGAME_PROBE_S`。
+    _probe_board: Board | None = None
+    _probe_since: float = 0.0
 
     def __post_init__(self) -> None:
         # `_idle_since` 的初值要用**注入的**时钟，不能是模块导入那一刻的真实时间。
@@ -320,18 +336,70 @@ class Session:
     def _step_idle(self) -> None:
         cur = self.deps.board_provider()
         if cur is None:
+            self._probe_reset()
             return
-        if not _looks_like_opening(cur):
-            self.message = "等待对局开始…"
+        if _looks_like_opening(cur):
+            self._probe_reset()
+            board = cur.copy()
+            board.side = RED  # 象棋红先
+            self.board = board
+            self._idle_since = self.deps.now()
+            self._unexplained = 0
+            self._last_unexplained = None
+            self.message = "检测到开局局面"
+            self.state = State.MY_TURN if self.my_side == RED else State.OPPONENT_TURN
             return
+        if self._probe_midgame(cur):
+            return
+        self.message = "等待对局开始…"
+
+    def _probe_midgame(self, cur: Board) -> bool:
+        """窗口里已经有一盘下到一半的棋时，接手它。返回 `True` 表示还在观察期。
+
+        真机场景：脚本被杀进程时那局停在中盘，再启动时窗口里就是一盘下到一半的棋。
+        按老逻辑它只认开局，于是永远停在「等待对局开始…」，眼睁睁看着自己那方超时。
+
+        判断只能靠**动没动**：
+
+        * 画面在 `MIDGAME_PROBE_S` 秒内变了 → 刚才是对方的回合，他刚落完子
+          → 现在轮到我方，`MY_TURN`；
+        * 一直纹丝不动 → 就当轮到我方（对方想棋想很久也是这个样子，那更没损失）。
+
+        `self.board.side` 一律设成 `my_side`，这是 `MY_TURN` 的不变式
+        （见 `_step_my_turn` 里那段注释），否则引擎会替对面算棋。
+        """
+        if not _looks_like_midgame(cur):
+            self._probe_reset()
+            return False
+        now = self.deps.now()
+        if self._probe_board is None:
+            self._probe_board = cur.copy()
+            self._probe_since = now
+            self.message = "看到一盘下到一半的棋，先看看轮到谁…"
+            return True
+        if _grid_diff(cur, self._probe_board) != 0:
+            # 画面动了：对方的着法刚落下来，现在轮到我方。
+            self._take_over(cur, "画面动了，对方刚落子，接手这一局")
+            return True
+        if now - self._probe_since < MIDGAME_PROBE_S:
+            return True
+        self._take_over(cur, "盯了一会儿没人动，当我方走，接手这一局")
+        return True
+
+    def _take_over(self, cur: Board, message: str) -> None:
         board = cur.copy()
-        board.side = RED  # 象棋红先
+        board.side = self.my_side
         self.board = board
+        self._probe_reset()
         self._idle_since = self.deps.now()
         self._unexplained = 0
         self._last_unexplained = None
-        self.message = "检测到开局局面"
-        self.state = State.MY_TURN if self.my_side == RED else State.OPPONENT_TURN
+        self.message = message
+        self.state = State.MY_TURN
+
+    def _probe_reset(self) -> None:
+        self._probe_board = None
+        self._probe_since = 0.0
 
     def _step_my_turn(self) -> None:
         cur = self.deps.board_provider()
@@ -520,7 +588,7 @@ class Session:
             return False
         if _grid_diff(cur, before) != 0:
             return False
-        tries = getattr(self, "_click_retries", 0)
+        tries = self._click_retries
         if tries >= CLICK_RETRIES:
             return False
         geom = self.deps.geometry_provider() if self.deps.geometry_provider else None
@@ -657,6 +725,21 @@ def _looks_like_opening(board: Board) -> bool:
     """棋子够多、双方将帅都在 —— 这才像一局棋，而不是大厅菜单。"""
     values = board.grid
     if int(np.count_nonzero(values)) < _MIN_OPENING_PIECES:
+        return False
+    red_king = 1  # PIECE_CHARS 里的 K
+    black_king = -1
+    return bool((values == red_king).any() and (values == black_king).any())
+
+
+def _looks_like_midgame(board: Board) -> bool:
+    """像一盘**下到一半**的棋：双方将帅都在，子数也够。
+
+    `_MIN_OPENING_PIECES` 是「子几乎没动过」的门槛，中盘当然达不到，
+    所以中盘只看「双方将帅都在 + 子数 >= `MIN_MIDGAME_PIECES`」。
+    装饰棋盘、大厅、结算画面要么是空的，要么认不出将帅，都会被挡掉。
+    """
+    values = board.grid
+    if int(np.count_nonzero(values)) < MIN_MIDGAME_PIECES:
         return False
     red_king = 1  # PIECE_CHARS 里的 K
     black_king = -1

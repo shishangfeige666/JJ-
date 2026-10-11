@@ -29,6 +29,7 @@ from jjchess.session import (
     BOARD_LOST_TIMEOUT_S,
     CLICK_RETRIES,
     MAX_UNEXPLAINED,
+    MIDGAME_PROBE_S,
     VERIFY_TIMEOUT_S,
     Session,
     SessionDeps,
@@ -781,6 +782,74 @@ def test_大厅画面不进对局():
     for _ in range(5):
         s.step()
     assert s.state is State.IDLE
+
+
+def _midgame_board() -> Board:
+    """一盘下到一半的棋：双方将帅都在，另有红炮/黑炮/红兵/黑卒。"""
+    b = Board.from_fen(START_FEN)
+    b.grid[:] = 0
+    b.grid[9, 4] = 1  # 红帅
+    b.grid[0, 4] = -1  # 黑将
+    b.grid[7, 1] = 2  # 红炮
+    b.grid[2, 1] = -2  # 黑炮
+    b.grid[6, 0] = 3  # 红兵
+    b.grid[3, 8] = -3  # 黑卒
+    b.side = RED
+    return b
+
+
+def test_中盘接手_画面不动就当我方走():
+    """真机场景：脚本被杀进程时那局停在中盘，再启动时窗口里就是一盘下到一半的棋。
+
+    老逻辑只认开局，于是永远停在「等待对局开始…」，眼睁睁看着自己那方超时。
+    """
+    p = _Provider(_midgame_board())
+    clock = _Clock()
+    s = _make_session(State.IDLE, provider=p, clock=clock)
+
+    s.step()
+    assert s.state is State.IDLE, "先看一段时间，不能一上来就抢着走"
+    assert "一半" in s.message
+
+    clock.advance(MIDGAME_PROBE_S - 0.5)
+    s.step()
+    assert s.state is State.IDLE, "还没盯够，继续看"
+
+    clock.advance(1.0)
+    s.step()
+    assert s.state is State.MY_TURN
+    assert s.board is not None and s.board.side == RED, "轮到我方，绝不能替对面算棋"
+
+
+def test_中盘接手_画面动了说明刚才轮到对方():
+    """观察期里画面动了 = 对方刚走完，那就采纳他走完的局面，轮到我方。"""
+    p = _Provider(_midgame_board())
+    clock = _Clock()
+    s = _make_session(State.IDLE, provider=p, clock=clock)
+
+    s.step()
+    assert s.state is State.IDLE
+
+    moved = _midgame_board()
+    moved.grid[7, 1] = 0
+    moved.grid[7, 4] = 2  # 红炮平中
+    p.board = moved
+    clock.advance(1.0)
+    s.step()
+    assert s.state is State.MY_TURN
+    assert s.board is not None
+    assert s.board.grid[7, 4] == 2, "要采纳对方刚走完的那个局面"
+
+
+def test_装饰棋盘不会被中盘接手():
+    """「正在匹配」那块装饰棋盘是空的 —— 将帅都认不出来，不能当成一盘棋接手。"""
+    empty = Board.from_fen(START_FEN)
+    empty.grid[:] = 0
+    s = _make_session(State.IDLE, provider=_Provider(empty))
+    for _ in range(5):
+        s.step()
+    assert s.state is State.IDLE
+    assert s.message == "等待对局开始…"
 
 
 # ============================================================ 暂停 / 停止
