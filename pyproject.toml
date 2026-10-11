@@ -1,0 +1,43 @@
+[project]
+name = "jjchess"
+version = "0.1.0"
+description = "微信小游戏「JJ象棋」自动下棋脚本：抓图识别 + 皮卡鱼引擎 + 自动点击"
+readme = "README.md"
+authors = [
+    { name = "JJ Dev", email = "dev@local" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "opencv-python>=5.0.0.93",
+]
+
+[project.scripts]
+jjchess = "jjchess.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+# 用户要求：所有包走阿里云 PyPI 镜像。必须是顶层表，不能写在 [project] 段内。
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# docs/ 下的 Markdown 里嵌着大量示例代码块，ruff 会去格式化它们并改写设计文档；
+# .superpowers/ 是执行计划的临时工作区。两者都不属于产品代码。
+extend-exclude = ["docs", ".superpowers", "_probe", "vendor"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]
