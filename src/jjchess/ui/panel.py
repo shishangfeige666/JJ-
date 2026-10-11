@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import os
+from ctypes import wintypes
 from typing import Any
 
 import cv2
@@ -41,6 +44,11 @@ _STATUS_H = 32
 _TITLE = "JJ象棋 自动下棋"
 _FEN_WRAP = 46
 
+#: 交给 OpenCV 的窗口标识，**必须是 ASCII**：OpenCV 的 Win32 后端用 `CreateWindowA`
+#: 建窗口，中文会按本地代码页解码成乱码标题（实测 `JJ象棋 自动下棋` 会变成
+#: `JJ璞℃…`）。窗口标题另外用 `SetWindowTextW` 补，见 `_find_own_window`。
+_WINDOW_KEY = "jjchess-panel"
+
 #: 会话消息里的中文片段 → ASCII 等价物。按长度从长到短替换，避免短片段先吃掉长片段。
 _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     (
@@ -53,8 +61,13 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ),
     ("引擎连续多次没有返回着法，已暂停", "engine returned no move repeatedly, paused"),
     ("点击后局面校验失败，已暂停", "board did not match after click, paused"),
+    (
+        "彩排：没真的点鼠标，局面不会变，已暂停（按 F10 关闭彩排）",
+        "rehearsal: no real click, board unchanged, paused (F10 to disable)",
+    ),
     ("拿不到棋盘几何，无法点击，已暂停", "no board geometry, cannot click, paused"),
     ("局面长时间不变，判定对局结束", "board unchanged for long, game over"),
+    ("已经看不到棋盘了，判定对局结束", "board is gone, game over"),
     ("已暂停（按 F8 继续）", "PAUSED (F8 to resume)"),
     ("看不懂局面变化（第 ", "cannot explain board change (attempt "),
     ("引擎没有返回着法（第 ", "engine returned no move (attempt "),
@@ -65,6 +78,7 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ("检测到开局局面", "opening position detected"),
     ("走子已确认", "move confirmed"),
     ("对方走 ", "opponent played "),
+    ("已走 ", "played "),
     ("走 ", "played "),
     ("继续", "RESUMED"),
     (" 次）", ")"),
@@ -252,6 +266,48 @@ def _draw_status(canvas: np.ndarray, session: Any) -> None:
         )
 
 
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def _find_own_window() -> int | None:
+    """找本进程创建的可见顶层窗口（也就是 OpenCV 的高亮窗口）。
+
+    按 PID 找而不是按标题找：标题此刻还是乱码，按标题匹配太脆。
+    """
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except OSError:  # pragma: no cover - 非 Windows 才会到这
+        return None
+    pid = os.getpid()
+    found: list[int] = []
+
+    def cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(_WNDENUMPROC(cb), 0)
+    return found[0] if found else None
+
+
+def _set_window_caption(title: str) -> bool:
+    """把高亮窗口的标题改成 `title`（UTF-16，绕开 OpenCV 的 ANSI 路径）。"""
+    hwnd = _find_own_window()
+    if hwnd is None:
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetWindowTextW(wintypes.HWND(hwnd), title)
+    except OSError:  # pragma: no cover - 非 Windows 才会到这
+        return False
+    return True
+
+
 class Panel:
     """把 `compose()` 的结果显示在窗口里。`enabled=False` 时只算不显示。"""
 
@@ -263,6 +319,7 @@ class Panel:
         self.height = height
         self.title = title
         self.frames = 0
+        self._caption_done = False
 
     def render(
         self,
@@ -274,7 +331,10 @@ class Panel:
         out = compose(frame, geom, rec, session, self.width, self.height)
         self.frames += 1
         if self.enabled:
-            cv2.imshow(self.title, out)
+            cv2.imshow(_WINDOW_KEY, out)
+            if not self._caption_done:
+                # 第一次 imshow 才真正建出窗口，标题只能在这之后补。
+                self._caption_done = _set_window_caption(self.title)
             cv2.waitKey(1)
         return out
 
@@ -283,7 +343,8 @@ class Panel:
         if not self.enabled:
             return
         try:
-            cv2.destroyWindow(self.title)
+            cv2.destroyWindow(_WINDOW_KEY)
         except cv2.error:
             pass
+        self._caption_done = False
         cv2.waitKey(1)

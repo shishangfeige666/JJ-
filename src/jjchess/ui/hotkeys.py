@@ -25,27 +25,33 @@ _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 _user32.GetAsyncKeyState.restype = ctypes.c_short
 
 
-def _key_down(vk: int) -> bool:
-    """只看最高位（当前是否按下）。
-
-    低位那个「上次调用后曾被按过」的标志位**不能用** —— 它会让一次按键在
-    之后的每一帧都重复上报，F8 会疯狂翻转暂停状态。
-    """
-    return (_user32.GetAsyncKeyState(vk) & 0x8000) != 0
+def _key_state(vk: int) -> int:
+    """`GetAsyncKeyState` 的原始返回值。"""
+    return int(_user32.GetAsyncKeyState(vk)) & 0xFFFF
 
 
 class Hotkeys:
-    """真实热键源。`is_down` 可注入，测试不必真的按键。"""
+    """真实热键源。`key_state` 可注入，测试不必真的按键。"""
 
-    def __init__(self, is_down: Callable[[int], bool] | None = None) -> None:
-        self._is_down = _key_down if is_down is None else is_down
+    def __init__(self, key_state: Callable[[int], int] | None = None) -> None:
+        self._key_state = _key_state if key_state is None else key_state
         self._held: set[str] = set()
 
     def poll(self) -> set[str]:
-        """返回本帧**新按下**的键名集合（按住不放不会重复返回）。"""
+        """返回本帧**新按下**的键名集合（按住不放不会重复返回）。
+
+        最高位（当前按下）与最低位（**上次查询之后曾被按下**）要一起看：
+        主循环一次迭代要抓图 + 让引擎想 1.2 秒，间隔常在 1 秒以上，人按一下
+        F8 只有一两百毫秒 —— 只看最高位会**整个漏掉**这次按键（实测踩到）。
+        最低位读一次就被清掉，所以它只会在按下后的第一次 `poll()` 里补报一次，
+        不会像早先担心的那样每帧重复上报。两个位都不再看时才认为键已松开。
+        """
         events: set[str] = set()
         for name, vk in _KEYS.items():
-            if self._is_down(vk):
+            state = self._key_state(vk)
+            pressed = bool(state & 0x8000)
+            tapped = bool(state & 0x0001)
+            if pressed or tapped:
                 if name not in self._held:
                     events.add(name)
                 self._held.add(name)

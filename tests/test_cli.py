@@ -14,17 +14,24 @@ import cv2
 import numpy as np
 import pytest
 
-from jjchess.config import DEFAULT_HUMAN_DELAY, parse_human_delay
+from jjchess.config import DEFAULT_HUMAN_DELAY, Config, parse_human_delay
 from jjchess.geometry import BLACK, RED, BoardGeometry
 from jjchess.main import (
+    FrameSettle,
     build_parser,
     count_pieces,
     detect_side,
+    dump_frame,
     grab_usable,
+    log_state,
     main,
     record_path,
     resolve_side,
+    screen_geometry,
+    trace_frame,
 )
+from jjchess.rules.board import START_FEN, Board
+from jjchess.session import State
 from jjchess.window import WindowNotFound
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -311,3 +318,132 @@ def test_记谱路径跟随debug_dir(tmp_path):
     stamp = dt.datetime(2026, 10, 11, 15, 30, 22)
     path = record_path(tmp_path, stamp)
     assert path == tmp_path / "game-20261011-153022.txt"
+
+
+# ============================================================ 状态日志
+
+
+class _FakeSession:
+    def __init__(self, state, message: str = "") -> None:
+        self.state = state
+        self.message = message
+
+
+def test_状态变化会打印一行(capsys):
+    """`--no-panel` 时这是唯一能看出会话卡在哪儿的窗口。"""
+    s = _FakeSession(State.THINKING, "正在思考")
+    assert log_state(s, None) is State.THINKING
+    assert "[THINKING]  正在思考" in capsys.readouterr().out
+
+
+def test_状态没变就不打印(capsys):
+    s = _FakeSession(State.MY_TURN)
+    log_state(s, State.MY_TURN)
+    assert capsys.readouterr().out == ""
+
+
+def test_没有消息时不留下多余空格(capsys):
+    s = _FakeSession(State.PLAYING)
+    log_state(s, State.THINKING)
+    assert capsys.readouterr().out.strip() == "[PLAYING]"
+
+
+# ============================================================ 客户区 → 屏幕
+
+
+def test_屏幕几何把客户区原点加回去():
+    """不换算的话点击会落到另一块显示器上 —— 而且干跑看不出来。
+
+    本机 JJ象棋 的客户区原点在 `(-1440, -279)`（竖屏副显示器）。
+    """
+    screen = screen_geometry(_FAKE_GEOM, (-1440, -279))
+    assert screen is not None
+    assert screen.origin == (-1340.0, -179.0)
+    # 间距与棋子直径不受平移影响
+    assert (screen.dx, screen.dy, screen.cell_px) == (80.0, 80.0, 64.0)
+    assert screen.cell_to_px(7, 7) == (100.0 + 7 * 80 - 1440, 100.0 + 7 * 80 - 279)
+
+
+def test_屏幕几何对None保持None():
+    assert screen_geometry(None, (-1440, -279)) is None
+
+
+# ============================================================ 现场取证
+
+
+class _FakeRec:
+    def __init__(self, fen: str) -> None:
+        self.board = Board.from_fen(fen)
+
+
+def test_画面FEN变了就打一行(capsys):
+    """模型和画面分歧时，这一行是唯一能对上账的证据。"""
+    rec = _FakeRec(START_FEN)
+    assert trace_frame(rec, None) == START_FEN
+    assert f"[画面] {START_FEN}" in capsys.readouterr().out
+
+
+def test_画面FEN没变就不打印(capsys):
+    rec = _FakeRec(START_FEN)
+    trace_frame(rec, START_FEN)
+    assert capsys.readouterr().out == ""
+
+
+def test_画面为空时保持上一次的FEN(capsys):
+    assert trace_frame(None, START_FEN) == START_FEN
+    assert capsys.readouterr().out == ""
+
+
+def test_没有debugdir时不存图(tmp_path):
+    cfg = Config(debug_dir=None)
+    dump_frame(np.zeros((4, 4, 3), np.uint8), cfg, "paused")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_暂停时把画面存成png(tmp_path):
+    """VERIFY 失败那一刻的画面必须留下来，否则事后只能靠猜。"""
+    cfg = Config(debug_dir=tmp_path)
+    img = np.full((6, 8, 3), 7, np.uint8)
+    dump_frame(img, cfg, "paused")
+    files = list(tmp_path.glob("frame-*-paused.png"))
+    assert len(files) == 1
+    back = cv2.imdecode(np.fromfile(str(files[0]), np.uint8), cv2.IMREAD_COLOR)
+    assert back.shape == (6, 8, 3)
+    assert int(back[0, 0, 0]) == 7
+
+
+# ============================================================ 画面停稳再上报
+
+
+def test_第一帧不算停稳():
+    """刚看到的局面不能立刻当真 —— 说不定棋子还在滑。"""
+    gate = FrameSettle(seconds=0.3)
+    assert gate.feed("A", 100.0) is False
+
+
+def test_同一个局面持续够久才算停稳():
+    gate = FrameSettle(seconds=0.3)
+    gate.feed("A", 100.0)
+    assert gate.feed("A", 100.29) is False
+    assert gate.feed("A", 100.31) is True
+
+
+def test_过渡帧会把计时重置():
+    """这正是真机踩到的坑：动画中途的每一帧都是「新局面」。"""
+    gate = FrameSettle(seconds=0.3)
+    gate.feed("A", 100.0)
+    gate.feed("B", 100.4)  # 棋子滑到一半
+    gate.feed("C", 100.8)  # 还在滑
+    assert gate.feed("C", 100.9) is False
+    assert gate.feed("C", 101.11) is True
+
+
+def test_停稳之后新局面的第一帧仍然不算停稳():
+    gate = FrameSettle(seconds=0.3)
+    gate.feed("A", 100.0)
+    assert gate.feed("A", 100.4) is True
+    assert gate.feed("B", 100.5) is False
+
+
+def test_屏幕几何原点为零时与客户区几何等价():
+    assert screen_geometry(_FAKE_GEOM, (0, 0)) == _FAKE_GEOM

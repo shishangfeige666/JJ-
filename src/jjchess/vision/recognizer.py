@@ -22,6 +22,19 @@
 3. **画面不对却照常返回一个局面** —— 空白帧、大厅画面。这个由上游挡：
    `window.is_blank_frame` 与 `vision.locator.locate`（找不到棋盘就抛 `BoardNotFound`）。
    `recognize` 本身**不做**画面合法性判断，它假定传进来的几何是对的。
+
+## 一个逃过 `locate` 的漏网之鱼
+
+`main.py` 只会在 `geom is None` 时重新 `locate()`，棋盘一旦定位成功就一直复用那套几何。
+可是**结算画面**（对局结束时弹出的「再来一局」）根本没法定位，`locate()` 会抛
+`BoardNotFound` —— 而它压根不会被再调一次。于是拿旧几何去认结算画面：
+
+    真机实测 `_probe/e2e/now.png`（结算画面）→ `9/9/9/9/9/9/9/9/9/9 w`，
+    `unknown` 15 格、最低置信度 0.129
+
+也就是一个「什么都不认识」的**空盘子**。这个空盘子会被当成合法局面喂给会话，
+把「棋盘消失 → `GAME_OVER`」那条路堵死（`_note_board` 只在 `None` 时才记账）。
+所以 `recognize` 之外还得有一个便宜的事后检查：`both_kings_present`。
 """
 
 from __future__ import annotations
@@ -35,10 +48,15 @@ from jjchess.geometry import BoardGeometry, ScreenMapper
 from jjchess.rules.board import CHAR_VALUES, RED, Board
 from jjchess.vision.templates import TemplateSet, make_patch
 
-__all__ = ["Recognition", "recognize"]
+__all__ = ["Recognition", "both_kings_present", "recognize"]
 
 BOARD_ROWS = 10
 BOARD_COLS = 9
+
+#: `CHAR_VALUES` 里红帅 / 黑将的取值。写成常量而不是散落的字面量，
+#: 免得「1 是帅还是兵」这种问题每次都要回去翻 board.py。
+KING_RED = CHAR_VALUES["K"]
+KING_BLACK = CHAR_VALUES["k"]
 
 
 @dataclass
@@ -101,3 +119,14 @@ def recognize(
     return Recognition(
         board=Board(grid=grid, side=side_to_move), confidence=confidence, unknown=unknown
     )
+
+
+def both_kings_present(board: Board) -> bool:
+    """双方将帅都在棋盘上 —— 这才是「一局棋」，而不是大厅、结算画面或认崩的一帧。
+
+    象棋里将帅**永远不会被吃掉**（被将死时对局当场结束），所以「两个将帅都在」
+    是一局进行中的棋必须成立的不变量。反过来说，一盘识别结果里少任何一个将帅，
+    它就不可能是真实局面 —— 与其拿它去喂引擎，不如当作「这一帧没读到棋盘」。
+    """
+    values = board.grid
+    return bool((values == KING_RED).any() and (values == KING_BLACK).any())

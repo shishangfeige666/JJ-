@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 import types
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from jjchess.ui.panel import Panel, compose
 from jjchess.vision.recognizer import Recognition
 
 WIDTH, HEIGHT = 1500, 900
+ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 OPENING_PNG = FIXTURES / "opening.png"
 
@@ -163,6 +165,59 @@ def test_状态文字是纯ASCII():
     assert raw.isascii(), f"面板文字必须全是 ASCII，实际：{raw!r}"
 
 
+def _session_messages() -> list[str]:
+    """从 `session.py` 里刮出所有会被面板显示的消息文本。
+
+    只认 `self.message = ...` 与 `self._auto_pause(状态, ...)` 的第二参数 ——
+    这两种是**唯一**的出口，其它中文字符串（异常、日志）不走面板。
+    f-string 里的插值统一换成 `X` 占位。
+    """
+    src = ROOT / "src" / "jjchess" / "session.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    def render(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            out = []
+            for part in node.values:
+                if isinstance(part, ast.Constant):
+                    out.append(str(part.value))
+                else:
+                    out.append("X")
+            return "".join(out)
+        return None
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Attribute) and t.attr == "message" for t in node.targets
+        ):
+            text = render(node.value)
+            if text:
+                found.append(text)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "_auto_pause" and len(node.args) >= 2:
+                text = render(node.args[1])
+                if text:
+                    found.append(text)
+    return found
+
+
+def test_session里的每条消息都能翻成可读ASCII():
+    """漏一条消息的翻译，屏幕上就会出现 `?` —— 这条测试盯着 session.py 的**全部**消息。
+
+    真实踩坑：新加的「彩排：没真的点鼠标…」没进 `_ASCII_TABLE`，面板上就只剩
+    `MSG:?F10?`。逐条列举的测试挡不住这种事，必须扫源码。
+    """
+    from jjchess.ui.panel import to_ascii
+
+    texts = _session_messages()
+    assert len(texts) >= 12, f"只刮到 {len(texts)} 条消息，测试本身失效了：{texts}"
+    bad = [t for t in texts if "?" in to_ascii(t)]
+    assert not bad, f"这些消息没进 _ASCII_TABLE：{bad}"
+
+
 # ============================================================ hotkeys
 
 
@@ -192,13 +247,14 @@ def _hotkeys_from(frames: list[set[str]]) -> Hotkeys:
     cursors = dict.fromkeys(_KEYS, 0)
     series = {name: [name in f for f in frames] for name in _KEYS}
 
-    def is_down(vk: int) -> bool:
+    def key_state(vk: int) -> int:
         name = vk_names[vk]
         i = cursors[name]
         cursors[name] += 1
-        return series[name][i] if i < len(series[name]) else False
+        down = series[name][i] if i < len(series[name]) else False
+        return 0x8000 if down else 0
 
-    return Hotkeys(is_down=is_down)
+    return Hotkeys(key_state=key_state)
 
 
 def test_真实热键按住不重复触发():
@@ -219,6 +275,45 @@ def test_真实热键松开再按会再触发():
 def test_真实热键能同时报多个键():
     hk = _hotkeys_from([{"pause", "quit"}])
     assert hk.poll() == {"pause", "quit"}
+
+
+def _hotkeys_by_state(rows: list[dict[int, int]]) -> Hotkeys:
+    """按帧脚本给出**原始** `GetAsyncKeyState` 返回值（按 vk 分别查表）。
+
+    `poll()` 会依次问完 `_KEYS` 里的每个键，问满一轮就前进一帧。
+    """
+    cursor = {"frame": 0, "asked": 0}
+
+    def key_state(vk: int) -> int:
+        cursor["asked"] += 1
+        if cursor["asked"] >= len(_KEYS):
+            cursor["asked"] = 0
+            cursor["frame"] += 1
+        i = cursor["frame"] - (1 if cursor["asked"] == 0 else 0)
+        row = rows[i] if 0 <= i < len(rows) else {}
+        return row.get(vk, 0)
+
+    return Hotkeys(key_state=key_state)
+
+
+def test_两次轮询之间快速点一下也能收到():
+    """真要命的场景：主循环一轮要一秒多，人按 F8 只有一两百毫秒。
+
+    只看「此刻是否按住」会整个漏掉；`GetAsyncKeyState` 的最低位正是为这种情况准备的。
+    这里模拟「按下又松开，两次 poll 之间已经结束」：最高位恒 0，最低位报一次。
+    """
+    hk = _hotkeys_by_state([{0x77: 0x0001}, {}, {}])
+    assert hk.poll() == {"pause"}
+    assert hk.poll() == set(), "补报只该发生一次"
+    assert hk.poll() == set()
+
+
+def test_按住时最低位不会造成重复触发():
+    """最低位在按下期间也会置位；不能因此每一帧都再报一次。"""
+    hk = _hotkeys_by_state([{0x77: 0x8001}, {0x77: 0x8000}, {0x77: 0x8001}, {}])
+    assert hk.poll() == {"pause"}
+    assert hk.poll() == set()
+    assert hk.poll() == set()
 
 
 # ============================================================ Panel

@@ -25,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from jjchess.config import DEFAULT_CONFIG_PATH, Config, load_config, parse_human_delay
@@ -38,7 +39,7 @@ from jjchess.session import Session, SessionDeps, State
 from jjchess.ui.hotkeys import Hotkeys
 from jjchess.ui.panel import Panel
 from jjchess.vision.locator import BoardNotFound, locate
-from jjchess.vision.recognizer import BOARD_COLS, BOARD_ROWS, recognize
+from jjchess.vision.recognizer import BOARD_COLS, BOARD_ROWS, both_kings_present, recognize
 from jjchess.vision.templates import (
     DEFAULT_TEMPLATES_PATH,
     EMPTY_LAPLACIAN,
@@ -50,14 +51,19 @@ from jjchess.vision.templates import (
 from jjchess.window import WindowNotFound, find_window, frame_usable
 
 __all__ = [
+    "FrameSettle",
     "build_overrides",
     "build_parser",
     "count_pieces",
     "detect_side",
+    "dump_frame",
     "grab_usable",
+    "log_state",
     "main",
     "record_path",
     "resolve_side",
+    "screen_geometry",
+    "trace_frame",
 ]
 
 #: 游戏窗口的标题。微信小程序宿主的标题就是小游戏名字。
@@ -71,6 +77,20 @@ GRAB_DELAY = 0.15
 MAX_BAD_STREAK = 10
 #: 主循环每轮的额外歇息，避免空转把 CPU 吃满。
 LOOP_SLEEP = 0.02
+#: 画面要连续稳定这么久，才把识别结果当成「新的局面」交给会话。
+#:
+#: 棋子是**滑过去**的，主循环 20ms 一轮，动画中途抓到的帧里棋子正卡在两格之间。
+#: 真机实测：黑方「卒 6 平 5 吃兵」的过程被逐帧喂进 `interpret`，模型先认成
+#: 「炮 7 进 8」、再认成别的，一步错步步错，最后只能暂停。等画面停下来再上报，
+#: 中间那些过渡帧就自然被丢掉了。
+SETTLE_SEC = 0.30
+#: 每隔这么久回头复查一次「棋盘还在不在」（秒）。
+#:
+#: 棋盘定位成功之后 `geom` 就一直复用，`locate()` 再也不会被调用 —— 那条
+#: 「找不到棋盘 → `BoardNotFound` → `GAME_OVER`」的路在实战里从来没被走过。
+#: 对局结束切到结算弹窗时，旧几何会把结算画面认成一盘空棋，会话读到的就是
+#: 「局面不对」而不是「棋盘没了」。复查本身只要约 12ms，代价可以忽略。
+RELOCATE_EVERY_S = 2.0
 #: 判定「这一排是红字」时，笔画像素的 R-B 至少要这么大。
 _RED_SIDE_MARGIN = 60.0
 #: 一格中心区域里至少要有这么多笔画像素才拿来判色。
@@ -199,6 +219,25 @@ def resolve_side(name: str, img: np.ndarray | None, geom: BoardGeometry | None) 
     if img is None or geom is None:
         return RED
     return detect_side(img, geom)
+
+
+def screen_geometry(
+    geom: BoardGeometry | None, client_origin: tuple[int, int]
+) -> BoardGeometry | None:
+    """把**客户区**几何平移到**屏幕绝对**坐标。
+
+    `locate()` 跑在 `grab()` 抓到的画面上，那个画面是客户区，左上角是 `(0, 0)`。
+    而 `mouse.play_move` 要的是屏幕绝对像素。本机 JJ象棋 的客户区原点在
+    `(-1440, -279)`（竖屏副显示器，窗口顶部还探出屏幕 279px），不换算的话点击会
+    落到**另一块显示器**上去 —— 而且干跑看不出来，因为 `[dry-run] 点击` 打印的就是
+    几何里那两个数。
+
+    面板那边要的仍然是客户区几何（它叠加的是客户区画面），所以两种几何并存，
+    这个函数专门产屏幕那一份。
+    """
+    if geom is None:
+        return None
+    return geom.with_offset(*client_origin)
 
 
 def count_pieces(img: np.ndarray, geom: BoardGeometry) -> int:
@@ -349,6 +388,83 @@ def _wait_for_board(args: argparse.Namespace, cfg: Config, window, hotkeys: Hotk
         return img, geom, rec, mapper, templates, my_side
 
 
+def log_state(session: Session, previous: State | None) -> State:
+    """状态一变就打印一行，返回新状态。
+
+    `--no-panel` 时这是**唯一**能看出会话在干什么的窗口。实测踩到过：不带面板跑
+    真机，脚本卡在 `PAUSED` 里一动不动，终端上却一句话都没有 —— 状态和 `message`
+    只画在面板上，人只能靠猜。有面板时这一行也不碍事，反而留下了可回看的轨迹。
+    """
+    if session.state is not previous:
+        suffix = f"  {session.message}" if session.message else ""
+        print(f"[{session.state.value}]{suffix}")
+    return session.state
+
+
+def dump_frame(img, cfg: Config, tag: str) -> None:
+    """把当前画面存进 `--debug-dir`，用于事后复盘。
+
+    真机跑出问题时不存图就只能靠猜：`VERIFY` 失败的那一刻画面长什么样、识别成什么，
+    事后完全看不到。文件名带 `tag` 与毫秒时间戳，同一次故障可以存多张。
+
+    **不用 `cv2.imwrite`** —— 它在非 ASCII 路径上会静默失败，只返回 False。
+    """
+    if cfg.debug_dir is None or img is None:
+        return
+    try:
+        cfg.debug_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%H%M%S-%f")[:-3]
+        path = cfg.debug_dir / f"frame-{stamp}-{tag}.png"
+        ok, buf = cv2.imencode(".png", img)
+        if ok:
+            path.write_bytes(buf.tobytes())
+    except OSError as exc:  # 存图失败绝不能拖垮整局
+        print(f"存图失败（{exc}）", file=sys.stderr)
+
+
+def trace_frame(rec, previous: str | None) -> str | None:
+    """画面里的局面一变就打一行 `[画面] <FEN>`，返回这次的 FEN。
+
+    这一行和 `log_state` 的 `[状态]` 行合起来才是完整的现场：只看状态会以为
+    「对方走 h9i7」是真的，其实那只是 `interpret` 猜出来的。把画面 FEN 单独打出来，
+    模型和 Reality 的分歧一眼就能对上。
+    """
+    if rec is None:
+        return previous
+    fen = rec.board.to_fen()
+    if fen != previous:
+        print(f"[画面] {fen}")
+    return fen
+
+
+class FrameSettle:
+    """把「画面还没停」的过渡帧挡在会话之外。
+
+    主循环 20ms 一轮，棋子却是几十毫秒滑过去的，所以一次走子会接连抓到好几帧
+    「棋子卡在两格之间」的过渡局面。这些帧直接喂给 `Session` 是灾难：`interpret`
+    会照着它们编出一个能自圆其说的假着法，模型就此一步错、步步错。
+
+    用法：每帧 `feed(fen, now)` 一次，只有返回 True 时才把这一帧的棋盘交给会话。
+    """
+
+    def __init__(self, seconds: float = SETTLE_SEC) -> None:
+        self.seconds = seconds
+        self._fen: str | None = None
+        self._since = 0.0
+
+    def feed(self, fen: str, now: float) -> bool:
+        """喂一帧的 FEN，返回「画面已经停稳，可以当成新局面了吗」。"""
+        if fen != self._fen:
+            self._fen = fen
+            self._since = now
+            return False
+        return now - self._since >= self.seconds
+
+    def reset(self) -> None:
+        self._fen = None
+        self._since = 0.0
+
+
 def _handle_hotkeys(keys: set[str], session: Session, mouse: Mouse) -> None:
     for key in keys:
         if key == "pause":
@@ -392,13 +508,18 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
             mapper=mapper,
             recorder=recorder,
             config=cfg,
-            geometry_provider=lambda: geom,
+            geometry_provider=lambda: screen_geometry(geom, window.client_origin),
         )
     )
     panel = Panel(enabled=not args.no_panel)
 
     print("开始对局。热键：F8 暂停/继续，F9 单步，F10 彩排，ESC 退出。")
     bad_streak = 0
+    last_state: State | None = None
+    last_fen: str | None = None
+    dumped = False
+    settle = FrameSettle()
+    last_locate = time.monotonic()
     try:
         while not session.should_stop:
             _handle_hotkeys(hotkeys.poll(), session, mouse)
@@ -415,6 +536,7 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 latest["board"] = None
                 rec = None
                 session.step()
+                last_state = log_state(session, last_state)
                 panel.render(None, geom, None, session)
                 time.sleep(0.3)
                 continue
@@ -425,14 +547,35 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 print("窗口尺寸变了，重新定位棋盘…", file=sys.stderr)
                 window.refresh()
                 geom = None
+            now = time.monotonic()
+            if geom is not None and now - last_locate >= RELOCATE_EVERY_S:
+                # 定期回头确认「棋盘还在不在」。
+                #
+                # 这里是真机踩出来的一个死角：棋盘一旦定位成功，`geom` 就一直被复用，
+                # 于是 `locate()` 再也不会被调用 —— 那条「找不到棋盘 → `BoardNotFound`
+                # → 棋盘消失 → `GAME_OVER`」的路**在实战里从来没被走过**。对局结束时
+                # 画面切到结算弹窗，拿旧几何去认会得到一盘空棋（或者一帧面目全非的
+                # 乱子），会话读到的是「局面不对」而不是「棋盘没了」，最后被误报成
+                # 「点击后局面校验失败」暂停。
+                #
+                # 所以每 `RELOCATE_EVERY_S` 秒复查一次：查不到就把 `geom` 清掉，
+                # 让下一帧走回 `BoardNotFound` 那条老路。复查本身只花约 12ms。
+                last_locate = now
+                try:
+                    locate(img)
+                except BoardNotFound:
+                    print("这一帧找不到棋盘，先当作棋盘已消失…", file=sys.stderr)
+                    geom = None
             if geom is None:
                 try:
                     geom = locate(img)
+                    last_locate = time.monotonic()
                     print(f"棋盘重新定位：{geom}")
                 except BoardNotFound:
                     latest["board"] = None
                     rec = None
                     session.step()
+                    last_state = log_state(session, last_state)
                     panel.render(img, None, None, session)
                     time.sleep(0.5)
                     continue
@@ -441,13 +584,35 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 rec = recognize(
                     img, geom, templates, mapper, side_to_move=RED, conf_min=cfg.conf_min
                 )
-                latest["board"] = rec.board
+                if rec is not None and not both_kings_present(rec.board):
+                    # 结算画面（「再来一局」弹窗）定位不了棋盘，可 `geom` 一直在复用，
+                    # 于是拿旧几何去认会得到一盘空棋。那不是局面，是「画面没了」。
+                    # 转成 `None` 交给会话，让它走 `BOARD_LOST` → `GAME_OVER` 那条路。
+                    print("[画面] 认不到双方将帅，当作棋盘已消失", file=sys.stderr)
+                    rec = None
             except Exception as exc:  # noqa: BLE001 - 单帧识别失败不该打断整局
                 print(f"识别失败（{exc}），跳过这一帧", file=sys.stderr)
                 latest["board"] = None
                 rec = None
 
+            if rec is None:
+                latest["board"] = None
+
+            if rec is not None and settle.feed(rec.board.to_fen(), time.monotonic()):
+                latest["board"] = rec.board
+
+            last_fen = trace_frame(rec, last_fen)
             session.step()
+            if last_state is not session.state and session.state is State.PAUSED:
+                # 暂停是要人来看的那一刻：把画面存下来，顺手把「模型以为的」和
+                # 「画面上的」两个 FEN 并排打出来，分歧一眼可见。
+                dump_frame(img, cfg, "paused")
+                if session.board is not None:
+                    print(f"[模型] {session.board.to_fen()}")
+                dumped = True
+            if session.state is not State.PAUSED and dumped:
+                dumped = False
+            last_state = log_state(session, last_state)
             panel.render(img, geom, rec, session)
             time.sleep(LOOP_SLEEP)
     except WindowNotFound as exc:

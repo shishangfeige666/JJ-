@@ -23,6 +23,8 @@ from jjchess.geometry import RED, BoardGeometry, ScreenMapper
 from jjchess.rules.board import START_FEN, Board
 from jjchess.rules.moves import legal_moves, make
 from jjchess.session import (
+    BOARD_LOST_TIMEOUT_S,
+    VERIFY_TIMEOUT_S,
     Session,
     SessionDeps,
     State,
@@ -155,6 +157,23 @@ class _Provider:
         return None if self.board is None else self.board.copy()
 
 
+class _Clock:
+    """可拨快的单调时钟。
+
+    走子校验是按**时间**给额度的（棋子滑过去的动画要时间，真机踩过 40ms 就判失败），
+    所以测「超时失败」不能靠真等 2.5 秒 —— 把时钟拨过去。
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
 def _make_session(
     state: State = State.MY_TURN,
     *,
@@ -163,6 +182,7 @@ def _make_session(
     config: Config | None = None,
     geom=_FAKE_GEOM,
     my_side: int = RED,
+    clock: _Clock | None = None,
 ) -> Session:
     deps = SessionDeps(
         board_provider=provider if provider is not None else (lambda: None),
@@ -172,6 +192,7 @@ def _make_session(
         recorder=None,
         config=config if config is not None else DEFAULTS,
         geometry_provider=(lambda: geom),
+        now=clock if clock is not None else time.monotonic,
     )
     s = Session(deps)
     s.board = Board.from_fen(START_FEN)
@@ -179,7 +200,7 @@ def _make_session(
     # 着法表里找黑方的着法，永远找不到。
     s.board.side = -my_side if state is State.OPPONENT_TURN else my_side
     s.state = state
-    s._idle_since = time.monotonic()
+    s._idle_since = deps.now()
     return s
 
 
@@ -295,14 +316,156 @@ def test_走子后局面校验失败会暂停():
     other = start.copy()
     make(other, "b2e2")
     p = _Provider(start)
-    s = _make_session(State.MY_TURN, provider=p)
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = False  # 这条测的是「真点了但没生效」，不是彩排
 
     _run_until(s, State.VERIFY)
     p.board = other  # 画面停在别处，永远对不上
+    s.step()
+    assert s.state is State.VERIFY, "刚点完还在动画里，不能立刻判失败"
+    clock.advance(VERIFY_TIMEOUT_S + 0.1)
+    s.step()
+    assert s.state is State.PAUSED
+    assert "校验失败" in s.message
+
+
+def test_彩排模式校验失败时给出彩排提示():
+    """彩排本来就不点鼠标，局面不会变是意料之中，提示要说清楚而不是报故障。"""
+    p = _Provider(Board.from_fen(START_FEN))
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = True
+
+    _run_until(s, State.VERIFY)
+    clock.advance(VERIFY_TIMEOUT_S + 0.1)
+    s.step()
+    assert s.state is State.PAUSED
+    assert "彩排" in s.message
+    assert "校验失败" not in s.message
+
+
+def test_抓图失败时校验原地等待不改局面():
+    """坏帧不是「局面没变」：抓不到画面就什么都别动。
+
+    推的秒数要**大于** `VERIFY_TIMEOUT_S`（否则测不到「超时也不算数」）
+    且**小于** `BOARD_LOST_TIMEOUT_S`（否则会走「棋盘没了 → 终局」那条路）。
+    """
+    p = _Provider(Board.from_fen(START_FEN))
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = False
+
+    _run_until(s, State.VERIFY)
+    p.board = None
+    clock.advance(VERIFY_TIMEOUT_S + 1.0)
+    s.step()
+    assert s.state is State.VERIFY, "抓不到画面不能当成校验失败"
+    assert s.board is not None and s.board.to_fen() == START_FEN
+
+
+def test_棋盘一直读不到就判定对局结束():
+    """真机现场：双車绝杀之后游戏切到结算画面，棋盘整个消失。
+
+    `board_provider()` 从此一直给 `None`，各状态里的「什么都不改，继续等」会永远
+    等下去。之前就是被 `VERIFY_TIMEOUT_S` 抢先把人引到「点击后局面校验失败」去了。
+    """
+    p = _Provider(Board.from_fen(START_FEN))
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = False
+
+    _run_until(s, State.VERIFY)
+    p.board = None
+
+    clock.advance(BOARD_LOST_TIMEOUT_S - 0.1)
+    s.step()
+    assert s.state is State.VERIFY, "还没到额度就收摊太急了"
+
+    # 失联计时是从**第一次读到 `None`** 那一刻起算的，所以这里要再走满一个额度。
+    clock.advance(BOARD_LOST_TIMEOUT_S)
+    s.step()
+    assert s.state is State.GAME_OVER
+    assert "看不到棋盘" in s.message
+
+
+def test_棋盘失联后恢复则重新计时():
+    """窗口被挡住几秒又露出来，不该被算成对局结束。"""
+    p = _Provider(Board.from_fen(START_FEN))
+    clock = _Clock()
+    s = _make_session(State.OPPONENT_TURN, provider=p, clock=clock)
+
+    p.board = None
+    clock.advance(BOARD_LOST_TIMEOUT_S - 0.5)
+    s.step()
+    p.board = Board.from_fen(START_FEN)
+    p.board.side = -RED
+    s.step()
+    assert s.state is State.OPPONENT_TURN, "读到棋盘就该把失联计时清零"
+
+    p.board = None
+    clock.advance(BOARD_LOST_TIMEOUT_S - 0.5)
+    s.step()
+    assert s.state is State.OPPONENT_TURN, "第二次失联要重新计时，不能接着上次算"
+
+
+def test_对方还着已经落下来时两步一起收():
+    """人机对战里对方想得很快：校验时画面可能已经是「我方走完 + 对方还着」。"""
+    start = Board.from_fen(START_FEN)
+    after_mine = start.copy()
+    make(after_mine, "h2e2")
+    after_both = after_mine.copy()
+    after_both.side = -RED
+    make(after_both, "h9g7")
+
+    p = _Provider(start)
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = False
+
+    _run_until(s, State.VERIFY)
+    p.board = after_both
+    s.step()
+    assert s.state is State.MY_TURN, "对方已经还着，收完两步该轮到我方"
+    assert s.board is not None and s.board.to_fen() == after_both.to_fen()
+
+
+# ============================================================ 自动暂停后的恢复点
+
+
+def test_几何缺失自动暂停后恢复重试同一步():
+    """几何拿不到只是点不了，不是这步走坏了；F8 恢复后该重试点击而不是重新想。"""
+    holder = {"geom": _FAKE_GEOM}
+    s = _make_session(State.MY_TURN, provider=_Provider(Board.from_fen(START_FEN)))
+    s.deps.geometry_provider = lambda: holder["geom"]
+
+    _run_until(s, State.PLAYING)
+    holder["geom"] = None
+    s.step()
+    assert s.state is State.PAUSED
+    assert "几何" in s.message
+
+    holder["geom"] = _FAKE_GEOM
+    s.resume()
+    assert s.state is State.PLAYING
+    s.step()
+    assert s.state is State.VERIFY  # 同一步真的点下去了
+    assert s.deps.mouse.clicks  # 两次点击（起子 + 落子）
+
+
+def test_对方回合看不懂变化后恢复仍停在对方回合():
+    """自动暂停必须记住该回到哪一格；旧实现会退回默认的 MY_TURN。"""
+    weird = Board.from_fen(START_FEN)
+    weird.set(6, 0, 0)  # 凭空少两个红兵：没有任何黑方着法能走成这样
+    weird.set(6, 2, 0)
+    weird.side = -RED
+    s = _make_session(State.OPPONENT_TURN, provider=_Provider(weird))
     for _ in range(5):
         s.step()
     assert s.state is State.PAUSED
-    assert "校验失败" in s.message
+    assert "看不懂" in s.message or "无法解释" in s.message
+    s.resume()
+    assert s.state is State.OPPONENT_TURN
 
 
 def test_对方走子被识别后轮到我方():

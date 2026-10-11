@@ -32,7 +32,7 @@ from __future__ import annotations
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -49,8 +49,9 @@ if TYPE_CHECKING:  # pragma: no cover - 只为类型标注
     from jjchess.rules.board import Board
 
 __all__ = [
+    "BOARD_LOST_TIMEOUT_S",
     "MAX_UNEXPLAINED",
-    "MAX_VERIFY_TRIES",
+    "VERIFY_TIMEOUT_S",
     "Session",
     "SessionDeps",
     "State",
@@ -60,8 +61,23 @@ __all__ = [
 
 #: `interpret` 连续失败多少次就认输暂停。
 MAX_UNEXPLAINED = 3
-#: 走子后局面校验失败后还允许重试几次。
-MAX_VERIFY_TRIES = 1
+#: 点完鼠标之后，画面最多容许「还没变过来」多久（秒）。
+#:
+#: 原来是「允许重试 1 次」，但主循环 20ms 一轮，两次校验之间只隔 40ms ——
+#: 游戏里棋子是**滑过去**的，40ms 连动画都没放完。真机实测就这样误判成
+#: 「点击后局面校验失败」而暂停。改成按时间给额度，动画多慢都不会误伤。
+#:
+#: 5 秒是量出来的：吃子那一下游戏会放一段「棋子闪烁 + 被吃子消失」的动画，
+#: 逐帧抓到的局面在两三个变体之间来回跳，实测要 2~3 秒才停稳，
+#: 再留 0.3 秒给画面稳定闸门，2.5 秒正好卡在边缘上（真机踩过）。
+VERIFY_TIMEOUT_S = 5.0
+#: 棋盘「读不到」多久就判定对局结束（秒）。
+#:
+#: 真机实测：我方用双車做成绝杀之后，游戏立刻切到结算画面（大红的「再来一局」），
+#: 棋盘整个消失 —— 定位层抛 `BoardNotFound`，`board_provider()` 一直给 `None`。
+#: 这时候不该报「点击后局面校验失败」把人引偏，而是老老实实收摊。
+#: 比 `gameover_idle_sec` 短，是因为「棋盘没了」比「棋盘没动」更确定。
+BOARD_LOST_TIMEOUT_S = 6.0
 #: 开局判定的棋子数下限（满盘 32 子，少几个也算，但大厅的空盘一定不够）。
 _MIN_OPENING_PIECES = 28
 
@@ -133,6 +149,8 @@ class SessionDeps:
     config: Config
     #: 棋盘几何也来自「当前这一帧」，所以同样用 provider 而不是固定值。
     geometry_provider: Callable[[], BoardGeometry | None] | None = None
+    #: 单调时钟。走子校验要按时间给额度，测试得能把它拨快。
+    now: Callable[[], float] = time.monotonic
 
 
 @dataclass
@@ -148,12 +166,17 @@ class Session:
 
     _pause_requested: bool = False
     _state_before_pause: State = State.MY_TURN
-    _idle_since: float = field(default_factory=time.monotonic)
+    _idle_since: float = 0.0
     _unexplained: int = 0
-    _verify_tries: int = 0
+    _play_at: float = 0.0
+    _board_lost_since: float | None = None
     _pending_move: str | None = None
     _board_before: Board | None = None
     _think_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        # `_idle_since` 的初值要用**注入的**时钟，不能是模块导入那一刻的真实时间。
+        self._idle_since = self.deps.now()
 
     # ---------------------------------------------------------------- 属性
 
@@ -187,6 +210,17 @@ class Session:
     def request_stop(self) -> None:
         """请求整个主循环退出（ESC）。"""
         self.should_stop = True
+
+    def _auto_pause(self, resume_state: State, message: str) -> None:
+        """自己发现不对劲而停下来（不是用户按 F8）。
+
+        必须同时记下「按 F8 之后该回到哪一格」：早先只有 `pause()` 会写
+        `_state_before_pause`，自动暂停会让它停在上一次显式暂停时的旧值，
+        按 F8 就恢复到跟当前情况无关的状态（比如对方回合的故障恢复成我方回合）。
+        """
+        self.state = State.PAUSED
+        self._state_before_pause = resume_state
+        self.message = message
 
     def step_once(self) -> None:
         """单步推进（F9）：暂停中也能往前走一步，走完仍然停住。
@@ -238,7 +272,7 @@ class Session:
         board = cur.copy()
         board.side = RED  # 象棋红先
         self.board = board
-        self._idle_since = time.monotonic()
+        self._idle_since = self.deps.now()
         self._unexplained = 0
         self._verify_tries = 0
         self.message = "检测到开局局面"
@@ -246,6 +280,8 @@ class Session:
 
     def _step_my_turn(self) -> None:
         cur = self.deps.board_provider()
+        if self._note_board(cur):
+            return
         if cur is not None and self.board is not None and _grid_diff(cur, self.board) != 0:
             # 轮到我方时局面却变了：可能是识别抖动，也可能对方真的走了。
             mv = interpret(self.board, cur, self.deps.config.tolerance_cells)
@@ -261,27 +297,25 @@ class Session:
         if board is None:  # pragma: no cover - 不该发生
             self.state = State.IDLE
             return
-        started = time.monotonic()
+        started = self.deps.now()
         analysis = self.deps.engine.analyse(  # type: ignore[attr-defined]
             board.to_fen(), self.deps.config.movetime_ms
         )
-        self._think_ms = max(1, int((time.monotonic() - started) * 1000))
+        self._think_ms = max(1, int((self.deps.now() - started) * 1000))
         self.last_analysis = analysis
 
         if not analysis.ok:
             self._unexplained += 1
             self.message = f"引擎没有返回着法（第 {self._unexplained} 次）"
             if self._unexplained >= MAX_UNEXPLAINED:
-                self.state = State.PAUSED
-                self.message = "引擎连续多次没有返回着法，已暂停"
+                self._auto_pause(State.MY_TURN, "引擎连续多次没有返回着法，已暂停")
             else:
                 self.state = State.MY_TURN
             return
 
         mv = analysis.bestmove
         if mv not in set(legal_moves(board)):
-            self.state = State.PAUSED
-            self.message = f"引擎给出的着法 {mv} 在当前局面下不合法，已暂停"
+            self._auto_pause(State.MY_TURN, f"引擎给出的着法 {mv} 在当前局面下不合法，已暂停")
             return
         self._unexplained = 0
 
@@ -305,18 +339,29 @@ class Session:
             return
         geom = self.deps.geometry_provider() if self.deps.geometry_provider else None
         if geom is None:
-            self.state = State.PAUSED
-            self.message = "拿不到棋盘几何，无法点击，已暂停"
+            # 回到 PLAYING：F8 恢复后重试同一步点击，而不是丢掉这一步重新想。
+            self._auto_pause(State.PLAYING, "拿不到棋盘几何，无法点击，已暂停")
             return
 
         self.deps.mouse.play_move(mv, geom)
         if self.deps.recorder is not None:
             self.deps.recorder.add(before, mv, self.last_analysis, self._think_ms)
-        self._verify_tries = 0
+        self._play_at = self.deps.now()
         self.message = f"已走 {mv}，等待画面确认"
         self.state = State.VERIFY
 
     def _step_verify(self) -> None:
+        """等画面变成「我方这步走完」的样子。
+
+        三条出路，按顺序判：
+
+        1. 画面正好等于预期（容许 `tolerance_cells` 格识别抖动）→ 确认，轮到对方；
+        2. 画面等于「我方走完**且对方已还着**」→ 两步一起收（对方想得太快时会发生）；
+        3. 都没等到、且已经超时 → 认为这一步没生效，回到 `MY_TURN` 重新决策。
+
+        抓图失败（`None`）时**什么都不改**，继续等 —— 坏帧不是「局面没变」。
+        但一直读不到棋盘（对局已经结束、画面切到结算）就得收摊，见 `BOARD_LOST_TIMEOUT_S`。
+        """
         mv = self._pending_move
         before = self._board_before
         if mv is None or before is None:  # pragma: no cover - 不该发生
@@ -326,20 +371,45 @@ class Session:
         make(expected, mv)
 
         cur = self.deps.board_provider()
-        if cur is not None and _grid_diff(cur, expected) == 0:
+        if self._note_board(cur):
+            return
+        if cur is None:
+            return
+
+        tol = self.deps.config.tolerance_cells
+        if _grid_diff(cur, expected) <= tol:
+            # 允许 `tolerance_cells` 格对不上：吃子那一瞬间抓到的帧可能正好少一格，
+            # 为它把整步判失败太亏。对方真还了一着至少动 2 格（起点 + 终点），
+            # 所以 `tol = 1` 不会把「对方已经还着」误判成「我方走成了」。
             self.board = expected
-            self._idle_since = time.monotonic()
+            self._idle_since = self.deps.now()
             self._pending_move = None
             self._board_before = None
-            self._verify_tries = 0
             self.message = "走子已确认"
             self.state = State.OPPONENT_TURN
             return
 
-        self._verify_tries += 1
-        if self._verify_tries > MAX_VERIFY_TRIES:
-            self.state = State.PAUSED
-            self.message = "点击后局面校验失败，已暂停"
+        if _grid_diff(cur, before) != 0:
+            # 画面确实动了，只是比我方这步多走了一步 —— 对方的还着已经落下来了。
+            reply = interpret(expected, cur, tol)
+            if reply is not None:
+                self.board = expected
+                self._pending_move = None
+                self._board_before = None
+                self._adopt(reply, opponent=True)
+                return
+
+        if self.deps.now() - self._play_at < VERIFY_TIMEOUT_S:
+            # 棋子是滑过去的，动画没放完就判失败会误伤（真机踩过）。
+            return
+
+        if getattr(self.deps.mouse, "dry_run", False):
+            # 彩排时本来就没点鼠标，局面当然不会变 —— 这不算故障，别吓唬人。
+            msg = "彩排：没真的点鼠标，局面不会变，已暂停（按 F10 关闭彩排）"
+        else:
+            msg = "点击后局面校验失败，已暂停"
+        # 画面没变成预期 → 这一步当没走过，恢复后重新决策（`self.board` 也没动）。
+        self._auto_pause(State.MY_TURN, msg)
 
     def _step_opponent_turn(self) -> None:
         # 静止计时先判：抓图一直失败（窗口最小化/被关掉）本身也是一种"对方没动"，
@@ -347,6 +417,8 @@ class Session:
         if self._check_idle():
             return
         cur = self.deps.board_provider()
+        if self._note_board(cur):
+            return
         if cur is None:
             # [RF-2] 抓图失败：**什么都不改**。绝不能把「没抓到」当成「棋盘空了」。
             return
@@ -358,8 +430,7 @@ class Session:
             self._unexplained += 1
             self.message = f"看不懂局面变化（第 {self._unexplained} 次）"
             if self._unexplained >= MAX_UNEXPLAINED:
-                self.state = State.PAUSED
-                self.message = "无法解释局面变化，已暂停（请检查识别）"
+                self._auto_pause(State.OPPONENT_TURN, "无法解释局面变化，已暂停（请检查识别）")
             return
 
         self._adopt(mv, opponent=True)
@@ -377,15 +448,34 @@ class Session:
         if self.deps.recorder is not None:
             self.deps.recorder.add(before, mv, None, None)
         self.board = delta
-        self._idle_since = time.monotonic()
+        self._idle_since = self.deps.now()
         self._unexplained = 0
         self.message = f"对方走 {mv}" if opponent else f"走 {mv}"
         self.state = State.MY_TURN
 
+    def _note_board(self, cur: Board | None) -> bool:
+        """记一笔「这次有没有读到棋盘」。`True` = 失联太久，已经转 `GAME_OVER`。
+
+        对局结束（被将死、认输、结算画面弹出）时棋盘会整个消失，`board_provider()`
+        从此一直给 `None`。这时候各状态里的「什么都不改，继续等」会永远等下去，
+        最后被别的超时错误地报成「校验失败」。所以「读不到」也要有额度。
+        """
+        if cur is not None:
+            self._board_lost_since = None
+            return False
+        now = self.deps.now()
+        if self._board_lost_since is None:
+            self._board_lost_since = now
+        if now - self._board_lost_since < BOARD_LOST_TIMEOUT_S:
+            return False
+        self.state = State.GAME_OVER
+        self.message = "已经看不到棋盘了，判定对局结束"
+        return True
+
     def _check_idle(self) -> bool:
         """局面静止过久。返回 `True` 表示已经接管了状态，调用方必须返回。"""
         limit = self.deps.config.gameover_idle_sec
-        if time.monotonic() - self._idle_since <= limit:
+        if self.deps.now() - self._idle_since <= limit:
             return False
         if self.state is State.OPPONENT_TURN:
             # [RF-4] 对方长考、掉线或已经走人 —— 这一局结束了。
@@ -393,8 +483,7 @@ class Session:
             self.message = "局面长时间不变，判定对局结束"
             return True
         # [RF-4] 轮到我方却长时间不动 = 有东西不对劲，停下来等人看，别草率收摊。
-        self.state = State.PAUSED
-        self.message = "轮到我方但局面异常静止，请检查（按 F8 继续）"
+        self._auto_pause(State.MY_TURN, "轮到我方但局面异常静止，请检查（按 F8 继续）")
         return True
 
 

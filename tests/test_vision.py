@@ -18,8 +18,8 @@ import pytest
 from jjchess import geometry as geo
 from jjchess.geometry import BoardGeometry, ScreenMapper
 from jjchess.rules.board import Board
-from jjchess.vision.locator import locate
-from jjchess.vision.recognizer import Recognition, recognize
+from jjchess.vision.locator import BoardNotFound, locate
+from jjchess.vision.recognizer import Recognition, both_kings_present, recognize
 from jjchess.vision.templates import DEFAULT_TEMPLATES_PATH, TemplateSet
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -197,3 +197,52 @@ def test_返回类型与不变式():
     assert rec.board.at(0, 4) == 1
     assert rec.board.side == geo.RED
     assert rec.confident is True
+
+
+def test_结算画面认不到将帅():
+    """对局结束弹出的「再来一局」结算画面 —— `both_kings_present` 必须说「不是棋」。
+
+    这是真机踩出来的坑：`main.py` 只在 `geom is None` 时重新 `locate()`，棋盘一旦
+    定位成功就一直复用旧几何。结算画面 `locate()` 会抛 `BoardNotFound`，可它压根
+    不会再被调一次，于是拿旧几何去认结算画面 —— 真机实测得到一盘空棋：
+
+        9/9/9/9/9/9/9/9/9/9 w，unknown 15 格，最低置信度 0.129
+
+    空盘子被当成合法局面喂给会话之后，「棋盘消失 → `GAME_OVER`」那条路就堵死了
+    （`Session._note_board` 只在拿到 `None` 时才记账），最后被误报成「校验失败」暂停。
+    """
+    img = _load_rgb(FIXTURES / "result.png")
+
+    # 结算画面定位不到棋盘 —— 上游本该在这里就拦住它。
+    with pytest.raises(BoardNotFound):
+        locate(img)
+
+    # 但如果几何是上一帧留下来的（真机就是这样），`recognize` 照样会返回一个局面：
+    # 一盘什么都没有的「空棋」，而且它看上去完全合法（没有异常、没有 unknown 之外
+    # 的信号）。这正是它对会话最危险的地方。
+    geom = locate(_load_rgb(FIXTURES / "mid_01.png"))
+    rec = recognize(img, geom, TemplateSet.load(DEFAULT_TEMPLATES_PATH), ScreenMapper(geo.RED))
+    assert not rec.board.grid.any(), "结算画面会被认成空盘"
+    assert both_kings_present(rec.board) is False
+
+
+@pytest.mark.parametrize(
+    ("pieces", "expected"),
+    [
+        ({(0, 4): 1, (9, 4): -1}, True),  # 双方将帅都在
+        ({(9, 4): -1}, False),  # 少了红帅
+        ({(0, 4): 1}, False),  # 少了黑将
+        ({}, False),  # 空盘（结算画面认出来的就是这个）
+    ],
+)
+def test_双方将帅都在才算一局棋(pieces, expected):
+    """象棋里将帅**永远不会被吃掉**（被将死时对局当场结束），所以这是硬不变量。
+
+    这里直接摆格子而**不是**用 `Board.from_fen` 造用例 —— `from_fen` 自己就拒绝
+    缺少将帅的 FEN（`非法 FEN：红帅必须恰好一个`）。也就是说「缺将帅」的局面只能
+    从识别层漏进来，这正是这个不变量要拦的东西。
+    """
+    grid = np.zeros((10, 9), dtype=np.int8)
+    for (rank, file), value in pieces.items():
+        grid[rank, file] = value
+    assert both_kings_present(Board(grid=grid, side=geo.RED)) is expected
