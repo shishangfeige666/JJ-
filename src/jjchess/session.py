@@ -76,8 +76,12 @@ VERIFY_TIMEOUT_S = 5.0
 #: 真机实测：我方用双車做成绝杀之后，游戏立刻切到结算画面（大红的「再来一局」），
 #: 棋盘整个消失 —— 定位层抛 `BoardNotFound`，`board_provider()` 一直给 `None`。
 #: 这时候不该报「点击后局面校验失败」把人引偏，而是老老实实收摊。
-#: 比 `gameover_idle_sec` 短，是因为「棋盘没了」比「棋盘没动」更确定。
-BOARD_LOST_TIMEOUT_S = 6.0
+#:
+#: **这是唯一可靠的终局信号**，所以宁可给宽一点：10 秒。绝杀之后游戏会先放一段
+#: 3~5 秒的 3D 动画（棋盘淡出、金色大字），动画期间棋盘本来就时有时无；
+#: 对局进行中也会偶发单帧读不到棋盘（真机日志里见过一次，下一帧就恢复）。
+#: 6 秒对这两种情况都太紧。代价只是终局晚 10 秒收摊，很划算。
+BOARD_LOST_TIMEOUT_S = 10.0
 #: 开局判定的棋子数下限（满盘 32 子，少几个也算，但大厅的空盘一定不够）。
 _MIN_OPENING_PIECES = 28
 
@@ -586,16 +590,27 @@ class Session:
         return True
 
     def _check_idle(self) -> bool:
-        """局面静止过久。返回 `True` 表示已经接管了状态，调用方必须返回。"""
-        limit = self.deps.config.gameover_idle_sec
+        """局面静止过久。返回 `True` 表示已经接管了状态，调用方必须返回。
+
+        **只暂停，绝不判终局。** 这里曾经是「对方回合 + 静止超时就 `GAME_OVER`」，
+        那是错的：对手长考是常态（JJ象棋陪练单步能想两分钟以上），「棋盘没动」
+        推不出「对局结束」。真机上一局走了没几步就被它收摊，记谱也白写了。
+
+        终局只认一个信号：**棋盘从画面上消失**（`_note_board` + `BOARD_LOST_TIMEOUT_S`）。
+        结算弹窗会把整个棋盘撤掉，那个信号准确得多。
+
+        `opponent_idle_sec <= 0`（默认）时整项检查关闭 —— 对方想多久就等多久。
+        """
+        limit = self.deps.config.opponent_idle_sec
+        if limit <= 0:
+            return False
         if self.deps.now() - self._idle_since <= limit:
             return False
         if self.state is State.OPPONENT_TURN:
-            # [RF-4] 对方长考、掉线或已经走人 —— 这一局结束了。
-            self.state = State.GAME_OVER
-            self.message = "局面长时间不变，判定对局结束"
+            self._auto_pause(
+                State.OPPONENT_TURN, "对方长时间没走棋，已暂停（按 F8 继续等待）"
+            )
             return True
-        # [RF-4] 轮到我方却长时间不动 = 有东西不对劲，停下来等人看，别草率收摊。
         self._auto_pause(State.MY_TURN, "轮到我方但局面异常静止，请检查（按 F8 继续）")
         return True
 

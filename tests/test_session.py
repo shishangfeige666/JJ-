@@ -4,8 +4,9 @@
        会话**绝不能**因此改动 `self.board` —— 那会被当成「棋盘上子没了」。
        注意：两种坏帧都在抓图层就被 `window.frame_usable` 挡下并折算成 `None`，
        所以这里一条用例同时覆盖它们。
-[RF-4] 局面长时间不变：**轮到我方**时必须判 `PAUSED`（等人来看），
-       只有**非我方回合**（对方长考/已离场）才能判 `GAME_OVER`。
+[RF-4] 局面长时间不变：**只暂停，绝不判终局**。对方长考是常态（JJ象棋陪练单步能想
+       两分钟以上），「棋盘没动」推不出「对局结束」；而且这项检查默认就关着
+       （`opponent_idle_sec = 0`）。终局只认「棋盘从画面上消失」。
 """
 
 from __future__ import annotations
@@ -258,27 +259,54 @@ def _run_until(s: Session, want: State, limit: int = 30) -> None:
     assert s.state is want, f"期望进入 {want}，实际停在 {s.state}：{s.message}"
 
 
-# ============================================================ [RF-4] 终局判定
+# ============================================================ [RF-4] 静止判定
+#
+# 真机教训：早先「对方回合 + 局面静止 12 秒」直接判 **GAME_OVER**，而 JJ象棋陪练
+# 单步能想两分钟以上 —— 一局刚走几步就被误判收摊。现在静止**只暂停、绝不判终局**，
+# 而且默认整项关闭（`opponent_idle_sec = 0`）；终局只认「棋盘从画面消失」。
 
 
-def test_轮到我方时局面不变_不进终局():
-    s = _make_session(State.MY_TURN)
+def _idle_config(seconds: float) -> Config:
+    return Config(opponent_idle_sec=seconds)
+
+
+def test_默认不检查静止_对方想多久都等():
+    s = _make_session(State.OPPONENT_TURN, config=Config())  # opponent_idle_sec = 0.0
+    s._idle_since = time.monotonic() - 1000
+    for _ in range(50):
+        s.step()
+    assert s.state is State.OPPONENT_TURN, "默认不该因为静止就暂停或收摊"
+
+
+def test_非我方回合静止超时_只暂停不终局():
+    s = _make_session(State.OPPONENT_TURN, config=_idle_config(12.0))
+    s._idle_since = time.monotonic() - 1000
+    s.step()
+    assert s.state is not State.GAME_OVER, "对手长考不是终局"
+    assert s.state is State.PAUSED
+    assert "对方长时间没走棋" in s.message
+
+
+def test_轮到我方时局面不变_暂停等人():
+    s = _make_session(State.MY_TURN, config=_idle_config(12.0))
     s._idle_since = time.monotonic() - 1000
     s.step()
     assert s.state is not State.GAME_OVER
-    assert s.state is State.PAUSED  # 改成暂停，等人来看
+    assert s.state is State.PAUSED
     assert "静止" in s.message or "异常" in s.message
 
 
-def test_非我方回合静止超时_进终局():
-    s = _make_session(State.OPPONENT_TURN)
+def test_对方静止超时后按F8还能继续等():
+    s = _make_session(State.OPPONENT_TURN, config=_idle_config(12.0))
     s._idle_since = time.monotonic() - 1000
     s.step()
-    assert s.state is State.GAME_OVER
+    assert s.state is State.PAUSED
+    s.resume()
+    assert s.state is State.OPPONENT_TURN, "恢复后要回到等对方走棋，而不是收摊"
 
 
-def test_刚开局的静止不算终局():
-    s = _make_session(State.OPPONENT_TURN)  # _idle_since 是当前时刻
+def test_刚开局的静止不算暂停():
+    s = _make_session(State.OPPONENT_TURN, config=_idle_config(12.0))  # _idle_since 是当前时刻
     s.step()
     assert s.state is State.OPPONENT_TURN
 
@@ -942,10 +970,15 @@ def test_思考时异常静止要真的停下来():
 
     随后那句 `self.state = State.PLAYING` 会把刚设好的 PAUSED 盖回去 ——
     面板和日志上写着「轮到我方但局面异常静止，请检查」，实际却在继续点击。
+
+    静止检查默认是关的（`opponent_idle_sec = 0`），所以这里显式打开才测得到。
     """
     clock = _Clock()
     s = _make_session(
-        State.THINKING, provider=_Provider(_model_board()), clock=clock
+        State.THINKING,
+        provider=_Provider(_model_board()),
+        clock=clock,
+        config=_idle_config(12.0),
     )
     s._idle_since = clock.t - 1000
 

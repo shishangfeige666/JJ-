@@ -40,7 +40,7 @@
 - **RF-1 游戏没开 / 窗口标题变了**：`window.py` 找不到 `JJ象棋` 窗口时，必须抛带中文说明的 `WindowNotFound` 并友好退出，不能抛 `AttributeError` 或退化成死循环。→ Task 8
 - **RF-2 抓图返回全白帧**：窗口最小化或被遮挡时 `PrintWindow` 会返回纯白图。必须能检测出空白帧并重试/降级/告警；**绝不能把全白帧当成"棋盘 32 子全空"** 而去走非法着法。→ Task 8 + Task 15
 - **RF-3 画面里根本没有棋盘**：停在「对战」大厅菜单、或弹出广告时，locator 必须判定失败并等待，不能把菜单纹理当网格线定位出一堆垃圾坐标。→ Task 10
-- **RF-4 局面长时间不变**：对方长考 / 网络卡顿时局面会静止很久。**轮到"我方"时局面不变必须判 PAUSED 告警，不能判 GAME_OVER**；只有「非我方回合 + 超时」或「底部按钮区亮度突增」才可判终局。→ Task 15
+- **RF-4 局面长时间不变**：对方长考 / 网络卡顿时局面会静止很久。**轮到我方时局面不变必须判 PAUSED 告警，不能判 GAME_OVER**；~~只有「非我方回合 + 超时」或「底部按钮区亮度突增」才可判终局~~ —— **后半句已被真机推翻**：对局进行中对方单步能想两分钟以上，「非我方回合 + 超时」也只能**暂停**；终局只认「棋盘从画面消失」。→ Task 15 / Task 19 Ruling
 - **RF-5 窗口被拖动 / 改尺寸 / 换显示器**：已缓存的 `calibration.json` 与 `BoardGeometry` 立即失效。必须每帧校验 hwnd 与客户区尺寸，变化则重新定位，不能继续对着旧坐标点击。→ Task 8 + Task 17
 
 ---
@@ -515,8 +515,8 @@ git -c user.name=dev -c user.email=dev@local commit -m "feat: BoardGeometry 像�
 **Interfaces:**
 - Consumes: 无
 - Produces:
-  - `@dataclass class Config`，字段：`engine_path: Path`、`nnue_path: Path`、`movetime_ms: int`、`threads: int`、`hash_mb: int`、`conf_min: float`、`conf_good: float`、`tolerance_cells: int`、`human_delay: tuple[float,float] | None`、`gameover_idle_sec: float`、`debug_dir: Path | None`、`record: bool`
-  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.60, conf_good=0.75, tolerance_cells=1, human_delay=None, gameover_idle_sec=12.0, record=True`）—— 置信度阈值从 0.75/0.90 下调见 Task 15 的 Ruling
+  - `@dataclass class Config`，字段：`engine_path: Path`、`nnue_path: Path`、`movetime_ms: int`、`threads: int`、`hash_mb: int`、`conf_min: float`、`conf_good: float`、`tolerance_cells: int`、`human_delay: tuple[float,float] | None`、`opponent_idle_sec: float`、`debug_dir: Path | None`、`record: bool`
+  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.60, conf_good=0.75, tolerance_cells=1, human_delay=None, opponent_idle_sec=0.0, record=True`）—— 置信度阈值从 0.75/0.90 下调见 Task 15 的 Ruling
   - `load_config(path: Path | None, overrides: dict) -> Config`
   - `parse_human_delay(arg: str | None) -> tuple[float,float] | None`
 
@@ -560,7 +560,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.config'`
   "engine": { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
               "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
   "vision": { "conf_min": 0.60, "conf_good": 0.75 },
-  "session": { "tolerance_cells": 1, "gameover_idle_sec": 12.0,
+  "session": { "tolerance_cells": 1, "opponent_idle_sec": 0.0,
                "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
   "record": true
 }
@@ -1396,7 +1396,7 @@ return None
   连续 3 次 `interpret` 返回 `None` 且 `cur != prev` → `PAUSED` 并 `message = "无法解释局面变化，已暂停（请检查识别）"`。
 - `IDLE`：`board_provider()` 返回的局面与 `START_FEN` 一致（或棋子数 ≥ 28 且双方将帅在位）→ 判定开局，转 `MY_TURN`。
 - **终局判定**：维护 `self._idle_since`（局面最后一次变化的时刻）。
-  - `state is OPPONENT_TURN` 且 `now - _idle_since > cfg.gameover_idle_sec` → `GAME_OVER`，`message = "局面长时间不变，判定对局结束"`。
+  - （**已被真机推翻，见 Task 19 Ruling「静止≠终局」**）`state is OPPONENT_TURN` 且 `now - _idle_since > cfg.opponent_idle_sec` → 只**暂停**，绝不 `GAME_OVER`；且 `opponent_idle_sec <= 0`（默认）时整项关闭。
   - `state is MY_TURN` 且超时 → **不得进 `GAME_OVER`**；改为 `PAUSED`，`message = "轮到我方但局面异常静止，请检查"`（`[RF-4]`）。
 - `pause()` 置 `_pause_requested`；`step()` 开头若已暂停则立刻 return（保证 `F8` 即时生效）。
 
@@ -1664,6 +1664,6 @@ git -c user.name=dev -c user.email=dev@local commit -m "docs: 使用说明与端
 
 **3. 类型一致性**：`Analysis` 在 T7 定义、T8/T15/T16/T17 消费，字段名一致；`Board.at/set/pieces/copy/from_fen/to_fen` 在 T2 定义后被 T3/T4/T12/T13/T15/T16 一致使用；`BoardGeometry.cell_to_px/px_to_cell/with_offset/to_json/from_json/is_plausible` 在 T5 定义后被 T9/T11/T12/T13/T14/T17 一致使用；`TemplateSet.load/match`、`Recognition.board/confidence/unknown`、`GameRecorder.add/to_text/iccs_line/save`、`Session.state/board/last_analysis/message/step/pause/resume/request_stop/should_stop` 均单次定义、多处引用，无改名。
 
-**4. Review Focus**：RF-1（T9 测试）、RF-2（T9 `is_blank_frame` 三条测试 + T16 `test_全白帧不改变已确认局面`）、RF-3（T11 `test_大厅帧判定无棋盘`）、RF-4（T16 `test_轮到我方时局面不变_不进终局` 与 `test_非我方回合静止超时_进终局`）、RF-5（T9 `size_changed` + T18 Step 4 的重定位循环）。五项全部有测试落位。
+**4. Review Focus**：RF-1（T9 测试）、RF-2（T9 `is_blank_frame` 三条测试 + T16 `test_全白帧不改变已确认局面`）、RF-3（T11 `test_大厅帧判定无棋盘`）、RF-4（T16 `test_非我方回合静止超时_只暂停不终局`、`test_轮到我方时局面不变_暂停等人`、`test_默认不检查静止_对方想多久都等`）、RF-5（T9 `size_changed` + T18 Step 4 的重定位循环）。五项全部有测试落位。
 
 **5. 比例**：本计划约 900 行，spec 约 580 行，比例合理；代码块只出现在「测试断言」与「算法不确定处」（perft 规则、投影峰拟合、UCI 读取时序、绝对坐标归一化），未逐行转写实现。

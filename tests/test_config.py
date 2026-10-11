@@ -54,7 +54,7 @@ def test_默认配置文件本身可解析():
     assert cfg.conf_min == 0.60
     assert cfg.conf_good == 0.75
     assert cfg.tolerance_cells == 1
-    assert cfg.gameover_idle_sec == 12.0
+    assert cfg.opponent_idle_sec == 0.0  # 默认不做静止检查，见 test_session 的 [RF-4]
     assert cfg.human_delay is None  # 文件里 enabled=false
     assert cfg.record is True
 

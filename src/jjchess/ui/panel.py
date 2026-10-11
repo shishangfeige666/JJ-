@@ -66,7 +66,14 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
         "rehearsal: no real click, board unchanged, paused (F10 to disable)",
     ),
     ("拿不到棋盘几何，无法点击，已暂停", "no board geometry, cannot click, paused"),
-    ("局面长时间不变，判定对局结束", "board unchanged for long, game over"),
+    (
+        "对方长时间没走棋，已暂停（按 F8 继续等待）",
+        "opponent idle for long, paused (F8 to keep waiting)",
+    ),
+    (
+        "轮到我方但局面异常静止，请检查（按 F8 继续）",
+        "my turn but board frozen, check (F8 to continue)",
+    ),
     ("已经看不到棋盘了，判定对局结束", "board is gone, game over"),
     ("已暂停（按 F8 继续）", "PAUSED (F8 to resume)"),
     (

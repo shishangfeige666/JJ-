@@ -479,7 +479,7 @@ rank = row
   "engine":  { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
                "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
   "vision":  { "conf_min": 0.60, "conf_good": 0.75 },
-  "session": { "tolerance_cells": 1, "gameover_idle_sec": 12.0,
+  "session": { "tolerance_cells": 1, "opponent_idle_sec": 0.0,
                "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
   "record":  true
 }
@@ -489,7 +489,7 @@ rank = row
 棋盘 ROI 比例 `ROI_TOP/ROI_BOTTOM = 0.15/0.80`、`ROI_LEFT/ROI_RIGHT = 0.01/0.99`、
 识别尺度 `ROI_SCALE = 1.30` / `SEARCH_SCALE = 1.90` / `TEMPLATE_PX = 72` / `MATCH_CORE_CELLS = 0.85` /
 `EMPTY_LAPLACIAN = 3000`（`src/jjchess/vision/templates.py`）、
-走子校验额度 `VERIFY_TIMEOUT_S = 5.0`、棋盘丢失额度 `BOARD_LOST_TIMEOUT_S = 6.0`（`src/jjchess/session.py`）、
+走子校验额度 `VERIFY_TIMEOUT_S = 5.0`、棋盘丢失额度 `BOARD_LOST_TIMEOUT_S = 10.0`（`src/jjchess/session.py`）、
 画面稳定闸门 `SETTLE_SEC = 0.50`、定期复查棋盘 `RELOCATE_EVERY_S = 2.0`（`src/jjchess/main.py`）。
 这些没做成配置项，是因为它们要么是「跟游戏画面绑定、换游戏才改」的量，
 要么是调参时反复量过、写死并配了注释与测试比暴露给用户更安全。

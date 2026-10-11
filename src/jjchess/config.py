@@ -32,7 +32,15 @@ class Config:
     conf_good: float = 0.75
     tolerance_cells: int = 1
     human_delay: tuple[float, float] | None = None
-    gameover_idle_sec: float = 12.0
+    #: 对方多少秒没走棋就**自动暂停**。`0` 表示不做这项检查（默认）。
+    #:
+    #: 早先这个字段叫 `gameover_idle_sec`、默认 12 秒，超时直接判**终局** —— 那是错的：
+    #: 对手长考是常态（JJ象棋陪练单步能想两分钟以上），「棋盘没动」推不出「对局结束」。
+    #: 真机上一局刚走几步就被它收摊。现在它只暂停、绝不判终局；而且默认关掉。
+    #:
+    #: 真正的终局信号是**棋盘从画面上消失**（见 `session.BOARD_LOST_TIMEOUT_S`）——
+    #: 结算弹窗会把整个棋盘撤掉，这个信号又准又不会误伤。
+    opponent_idle_sec: float = 0.0
     debug_dir: Path | None = None
     record: bool = True
 
@@ -89,7 +97,7 @@ def _from_sections(data: dict) -> Config:
         conf_good=float(vision.get("conf_good", DEFAULTS.conf_good)),
         tolerance_cells=int(session.get("tolerance_cells", DEFAULTS.tolerance_cells)),
         human_delay=human_delay,
-        gameover_idle_sec=float(session.get("gameover_idle_sec", DEFAULTS.gameover_idle_sec)),
+        opponent_idle_sec=float(session.get("opponent_idle_sec", DEFAULTS.opponent_idle_sec)),
         debug_dir=Path(debug_dir) if debug_dir else None,
         record=bool(data.get("record", DEFAULTS.record)),
     )
