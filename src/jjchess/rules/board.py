@@ -38,6 +38,7 @@ START_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0
 #: 字母沿用 XQ-FEN（国际象棋式）而非拼音首字母：`B`=相/象、`N`=马/馬。
 #: 这是皮卡鱼唯一接受的拼法（开局 FEN 里就是 `rnbakabnr`），
 #: 写成拼音的 `E`/`H` 会被引擎判为非法局面并自杀退出。
+#: **输出永远用这套规范字母**；拼音写法只在解析时作为别名接受（见下）。
 PIECE_CHARS: dict[int, str] = {
     K: "K",
     A: "A",
@@ -56,8 +57,21 @@ PIECE_CHARS: dict[int, str] = {
     0: ".",
 }
 
-#: FEN 字符 → 棋子编码（`PIECE_CHARS` 的反向表）。
-CHAR_VALUES: dict[str, int] = {ch: value for value, ch in PIECE_CHARS.items()}
+#: 解析时额外接受的**拼音首字母**别名。象棋记法里只有相/象、马/馬 两字的
+#: 拼音首字母（E、H）与 XQ-FEN 规范字母（B、N）不同，其余 K/A/R/C/P 一致。
+#: 只放宽输入、不影响输出，因此任何 `to_fen()` 的结果送进皮卡鱼都合法。
+PIECE_CHAR_ALIASES: dict[str, int] = {
+    "E": E,
+    "H": H,
+    "e": -E,
+    "h": -H,
+}
+
+#: FEN 字符 → 棋子编码（`PIECE_CHARS` 的反向表，附加拼音别名）。
+CHAR_VALUES: dict[str, int] = {
+    **{ch: value for value, ch in PIECE_CHARS.items()},
+    **PIECE_CHAR_ALIASES,
+}
 
 #: FEN 里表示空点的字符（`0` 与 `.` 都接受，输出统一用 `.`）。
 _EMPTY_CHARS = frozenset("0.")
