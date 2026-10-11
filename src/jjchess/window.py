@@ -10,6 +10,10 @@ r"""JJ象棋窗口的发现与抓图（纯 ctypes，不引入第三方依赖）�
 
 窗口是微信电脑版的小程序宿主（进程 `WeChatAppEx`），不是模拟器，所以不需要 adb。
 
+`PrintWindow` 也会**零星**返回两种不可用的帧，抓完图必须过 `frame_usable`：
+整帧全黑/全白的**空白帧**（`is_blank_frame`），以及右下角整块未初始化的**残缺帧**
+（`is_torn_frame`）。两者都会被识别层误读成「棋盘上的子没了」。
+
 Win64 上句柄是 64 位，**所有 API 都必须显式声明 `argtypes` / `restype`**，
 不声明会被 ctypes 按 `c_int` 截断。
 
@@ -194,26 +198,63 @@ def _client_area(hwnd: int) -> int:
     return max(right - left, 0) * max(bottom - top, 0)
 
 
+def _to_gray(img: np.ndarray | None) -> np.ndarray | None:
+    """转成 float32 灰度图；空输入返回 `None`。"""
+    if img is None:
+        return None
+    arr = np.asarray(img)
+    if arr.size == 0:
+        return None
+    if arr.ndim == 3:
+        return arr[..., :3].astype(np.float32).mean(axis=2)
+    return arr.astype(np.float32)
+
+
 def is_blank_frame(img: np.ndarray | None) -> bool:
     """判断是不是"什么都没抓到"的空白帧。
 
     最小化、被完全遮挡、或 `PrintWindow` 失败时会拿到纯色图。**这种帧绝不能
     当成「32 子全空」**，否则会走出一堆非法着法。
     """
-    if img is None:
+    gray = _to_gray(img)
+    if gray is None:
         return True
-    arr = np.asarray(img)
-    if arr.size == 0:
-        return True
-    if arr.ndim == 3:
-        gray = arr[..., :3].astype(np.float32).mean(axis=2)
-    else:
-        gray = arr.astype(np.float32)
     # 纯色（含纯白、纯黑）→ 空白。
     if float(gray.std()) < 1.0:
         return True
     # 近全白（压缩噪点会留几个杂点）也算空白。
     return float((gray >= 254.0).mean()) >= 0.99
+
+
+#: 「残缺帧」判据：近黑像素占比超过这个值就认为 PrintWindow 只画了一部分。
+#: 实测（灰度 < 10 的像素占比）：好帧 ~1.1%（`lobby.png` 0.0111 / `opening.png` 0.0113），
+#: 残缺帧 ~30%（`torn_frame.png` 0.2993）。27 倍的间隔，取 0.10 很稳。
+TORN_DARK_RATIO = 0.10
+TORN_DARK_LEVEL = 10.0
+
+
+def is_torn_frame(img: np.ndarray | None) -> bool:
+    """判断是不是 PrintWindow 只画了一部分的"残缺帧"。
+
+    真机实测（2026-10-11）：`PrintWindow(..., 2)` 偶尔会返回一张**右下角整块全黑**
+    的画面（未初始化的位图区），其余部分完全正常。它不是空白帧（平均亮度 88.66，
+    远不到纯色判据），所以 `is_blank_frame` 拦不住它。
+
+    危害比空白帧更隐蔽：黑区里的格子**看起来是空的**，于是整盘棋像是凭空少了一半
+    子力 —— 脚本会以为对方刚吃掉自己七八个子。所以抓完图必须过 `frame_usable`。
+    """
+    gray = _to_gray(img)
+    if gray is None:
+        return True
+    return float((gray < TORN_DARK_LEVEL).mean()) >= TORN_DARK_RATIO
+
+
+def frame_usable(img: np.ndarray | None) -> bool:
+    """这一帧能不能信 —— 抓图之后、识别之前的统一闸门。
+
+    空白帧与残缺帧都要丢掉重抓。返回 `False` 时**不要**把帧传给识别层。
+    """
+    return not is_blank_frame(img) and not is_torn_frame(img)
 
 
 @dataclass
@@ -272,6 +313,9 @@ class GameWindow:
         每次都按**当前**客户区尺寸分配位图（不读缓存的 `client_size`），这样
         窗口刚被改过尺寸也不会拿到错位的画面；缓存要不要更新由 `refresh()`
         决定，`size_changed()` 靠这个差值来判断标定是否失效。
+
+        ⚠️ 返回的帧**还要过一遍 `frame_usable`**：本方法只在「`PrintWindow`
+        返回 0 且抓到空白」时才抛异常，删残缺帧（`is_torn_frame`）是调用方的事。
         """
         if not self.is_alive():
             raise WindowNotFound(f"窗口 {self.title!r} 已关闭")

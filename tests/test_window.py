@@ -15,7 +15,14 @@ import cv2
 import numpy as np
 import pytest
 
-from jjchess.window import WindowNotFound, find_window, is_blank_frame
+from jjchess.window import (
+    TORN_DARK_RATIO,
+    WindowNotFound,
+    find_window,
+    frame_usable,
+    is_blank_frame,
+    is_torn_frame,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -77,6 +84,52 @@ def test_空白帧检测_真机抓到的全黑帧():
     assert img is not None, "缺少 tests/fixtures/blank_frame.png"
     assert img.mean() < 1.0  # 确实是全黑
     assert is_blank_frame(img) is True
+
+
+def test_残缺帧检测_真机抓到的半张黑帧():
+    """真机回归：PrintWindow 会返回「右下角整块全黑」的残缺帧。
+
+    2026-10-11 用 `tools/record_frames.py --watch` 抓到 `mid_162214.png`：
+    棋盘左上部分完全正常，从中间斜着切下去全是黑的（位图区未初始化）。
+
+    它不是空白帧 —— 平均亮度 88.66，`is_blank_frame` 判 `False`。但黑区里的格子
+    拉普拉斯方差≈0，会被识别层判成「空」，于是整盘看起来像红方凭空少了七八个子。
+    所以必须有第二道闸。
+    """
+    img = _load_fixture("torn_frame.png")
+    assert img is not None, "缺少 tests/fixtures/torn_frame.png"
+    assert not is_blank_frame(img)  # 空白判据拦不住它
+    assert is_torn_frame(img) is True
+    assert frame_usable(img) is False
+
+
+def test_残缺帧判据不误伤好帧():
+    """好帧的近黑像素占比约 1.1%，离 10% 的阈值有 9 倍余量。"""
+    for name in ("lobby.png", "opening.png"):
+        img = _load_fixture(name)
+        assert img is not None, f"缺少 tests/fixtures/{name}"
+        dark = float((np.asarray(img).astype(np.float32).mean(axis=2) < 10.0).mean())
+        assert dark < TORN_DARK_RATIO / 2.0, f"{name} 近黑占比 {dark:.4f}，余量不足"
+        assert is_torn_frame(img) is False
+        assert frame_usable(img) is True
+
+
+def test_残缺帧判据_合成半黑图():
+    """合成一张左半正常、右半全黑的图 —— 判据要按面积占比而不是位置。"""
+    rng = np.random.default_rng(20261011)
+    noise = rng.integers(60, 200, (400, 400, 3), dtype=np.uint8)
+    img = noise.copy()
+    img[:, 200:] = 0  # 50% 黑
+    assert is_torn_frame(img) is True
+    img = noise.copy()
+    img[:, 380:] = 0  # 5% 黑，安全区
+    assert is_torn_frame(img) is False
+
+
+def test_空白帧与残缺帧都不可用():
+    assert frame_usable(None) is False
+    assert frame_usable(np.full((100, 100, 3), 255, np.uint8)) is False
+    assert frame_usable(np.zeros((100, 100, 3), np.uint8)) is False
 
 
 @pytest.mark.skipif(not _game_running(), reason="JJ象棋未运行")
