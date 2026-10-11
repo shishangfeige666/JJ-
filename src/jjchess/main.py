@@ -704,6 +704,15 @@ def _next_round(window, hotkeys: Hotkeys, mouse: Mouse):
 
 def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     hotkeys = Hotkeys()
+    # 启动时正停在结算画面（上一局刚下完）→ 先把「再来一局」点了再等棋盘。
+    #
+    # 不点的话 `_wait_for_board` 会拿到终局局面：练习局的结算画面**棋盘还留在
+    # 屏幕上**（显示终局局面），定位得到、双方将帅也都认得出，看起来就是一盘棋，
+    # 于是脚本会在一盘已经下完的棋上面走子。真机 run16 之后就停在这儿。
+    first = grab_usable(window)
+    if first is not None and is_result_screen(first) and not args.dry_run:
+        print("启动时正停在结算画面，先点「再来一局」。")
+        _next_round(window, hotkeys, Mouse(dry_run=False, my_side=RED))
     ready = _wait_for_board(args, cfg, window, hotkeys)
     if ready is None:
         return EXIT_OK
@@ -888,7 +897,17 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     # （几何纵向偏 6 像素，红方底线那格置信度掉到 0.37），脚本因此停了
                     # 十几分钟不动。认干净了就换过去。
                     rec = _retry_unknown(img, geom, templates, mapper, cfg, rec)
-                if rec is not None and not both_kings_present(rec.board):
+                if rec is not None and is_result_screen(img):
+                    # 练习局（「JJ象棋陪练」）的结算画面**棋盘还留在屏幕上**，
+                    # 显示的是终局局面 —— 定位得到，双方将帅也都认得出，
+                    # 看起来和一盘正在下的棋一模一样，只有底下那颗绿色的
+                    # 「再来一局」能把它认出来。
+                    #
+                    # 不拦的话，会话会拿终局局面去和「我方这步之后的预期」比，
+                    # 5 秒后报「点击后局面校验失败，已暂停」—— 而棋其实早就下完了。
+                    # 真机 run16 撞上：我方绝杀赢了，脚本反而停住了。
+                    reason = "这一帧是结算画面（有「再来一局」），当作棋盘已消失"
+                elif rec is not None and not both_kings_present(rec.board):
                     # 结算画面（「再来一局」弹窗）定位不了棋盘，可 `geom` 一直在复用，
                     # 于是拿旧几何去认会得到一盘空棋。那不是局面，是「画面没了」。
                     # 转成 `None` 交给会话，让它走 `BOARD_LOST` → `GAME_OVER` 那条路。
