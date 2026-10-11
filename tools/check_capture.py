@@ -24,6 +24,13 @@ TARGET_TITLE = "JJ象棋"
 ERROR_ACCESS_DENIED = 5
 PROBE_W, PROBE_H = 400, 300
 
+# 输出里有 `✓` 这类不在 GBK 里的字符：stdout 被重定向（管道、写文件）时 Python
+# 改用系统编码写，会直接抛 UnicodeEncodeError 把自检打断。自检工具宁可把打不出的
+# 字换成 `?` 也不能崩 —— 终端里正常显示时这条不生效。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
 u = ctypes.WinDLL("user32", use_last_error=True)
 g = ctypes.WinDLL("gdi32", use_last_error=True)
 
