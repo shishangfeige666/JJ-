@@ -424,6 +424,32 @@ def test_请求停止后step不做任何事():
     assert s.state is State.MY_TURN
 
 
+def test_单步在暂停中也能推进一步():
+    """F9 的语义：暂停着也能往前走一步，走完仍然停住。"""
+    s = _make_session(State.MY_TURN)
+    s.pause()
+    assert s.state is State.PAUSED
+    s.step_once()
+    assert s.state is State.THINKING, "单步应该真的推进了一格"
+    s.step()
+    assert s.state is State.PAUSED, "单步之后不许继续跑"
+
+
+def test_单步不会把暂停解掉():
+    s = _make_session(State.MY_TURN)
+    s.pause()
+    s.step_once()
+    assert s._pause_requested is True
+    s.step()
+    assert s.state is State.PAUSED
+
+
+def test_未暂停时单步就是普通一步():
+    s = _make_session(State.MY_TURN)
+    s.step_once()
+    assert s.state is State.THINKING
+
+
 # ============================================================ 拟人化延迟（S7）
 
 

@@ -188,6 +188,19 @@ class Session:
         """请求整个主循环退出（ESC）。"""
         self.should_stop = True
 
+    def step_once(self) -> None:
+        """单步推进（F9）：暂停中也能往前走一步，走完仍然停住。
+
+        注意是「走完停住」而不是「走完继续跑」—— F9 是给暂停态用的放大镜，
+        松开 F9 不该顺带把暂停解掉。
+        """
+        if self.state is State.PAUSED:
+            self._pause_requested = False
+            self.state = self._state_before_pause
+        self.step()
+        if self.state is not State.GAME_OVER:
+            self._pause_requested = True
+
     # ---------------------------------------------------------------- 主循环
 
     def step(self) -> None:
