@@ -1548,6 +1548,7 @@ Expected: FAIL —— `AttributeError: module 'jjchess.main' has no attribute 'b
 uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
                [--human-delay [MIN-MAX]] [--no-record] [--config PATH]
+               [--rounds N]        # 后加：连下几局；0（默认）= 一直下
 ```
 `--human-delay` 用 `nargs="?"`, `const=""`（裸开关传空串，交给 `parse_human_delay` 解释）；`--side` 用 `choices=["auto","red","black"]`。
 

@@ -324,6 +324,62 @@ def test_按住时最低位不会造成重复触发():
     assert hk.poll() == set()
 
 
+def _latching_key_state(latch: dict[int, int]):
+    """模拟真 API：读一次就把「上次查询之后按下过」那位清掉。"""
+
+    def key_state(vk: int) -> int:
+        state = latch.get(vk, 0)
+        latch.pop(vk, None)
+        return state
+
+    return key_state
+
+
+def test_启动时残留的锁存位不算按下():
+    """真机反馈「F10 默认是开的」的根因。
+
+    `GetAsyncKeyState` 的最低位是**会话级**锁存：上一次运行里按下的键，只要之后
+    没人查过它就一留着，新进程第一次 `poll()` 会把它当成「刚按下」。于是脚本
+    一启动就自己切进彩排模式；换成 ESC 就是刚起来就退出。
+    """
+    latch = {0x79: 0x0001}  # F10 的锁存位还挂着
+    hk = Hotkeys(key_state=_latching_key_state(latch), clear_latches=True)
+    assert hk.poll() == set(), "启动时残留的 F10 不该被当成刚按下"
+
+    latch[0x79] = 0x0001  # 这回是真按的
+    assert hk.poll() == {"dryrun"}, "启动之后真按下还是要认得出来"
+
+
+def test_不清锁存位时残留会被当成刚按下():
+    """把上一条反过来钉死：不清就是错的行为，防以后有人把 `_clear_latches` 删掉。"""
+    latch = {0x79: 0x0001}
+    hk = Hotkeys(key_state=_latching_key_state(latch), clear_latches=False)
+    assert hk.poll() == {"dryrun"}
+
+
+def test_启动时本来就按住的键要等松开再按():
+    """用户按着 F8 启动了脚本，不该立刻暂停 —— 那一下不是「刚按下」。"""
+
+    def key_state(vk: int) -> int:
+        return 0x8000 if vk == 0x77 else 0
+
+    hk = Hotkeys(key_state=key_state, clear_latches=True)
+    assert hk.poll() == set(), "启动时就按着不算新按下"
+    assert hk.poll() == set()
+
+
+def test_默认用真源才清锁存位():
+    """注入假源时默认不清：按帧脚本的替身多问几次就打乱了它的节奏。"""
+    asked: list[int] = []
+
+    def key_state(vk: int) -> int:
+        asked.append(vk)
+        return 0
+
+    Hotkeys(key_state=key_state)
+    assert asked == [], "假源默认不该被多问一轮"
+
+
 # ============================================================ Panel
 
 

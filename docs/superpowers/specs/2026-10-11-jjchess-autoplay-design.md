@@ -335,7 +335,9 @@ cur  = 本帧识别结果
 
 **我方走子校验**：点击后等待画面稳定（连续 2 帧相同），比对是否 ≈ `make(prev, my_move)`；不符 → 重试 1 次 → 仍不符则 `PAUSED`。
 
-**终局检测**：局面连续 12 秒不变 且 非我方回合，或检测到底部弹出按钮区域亮度突增 → 判定对局结束，停止并打印对局记录。
+**终局检测**（设计稿原文，**已被真机推翻并改掉**）：原写「局面连续 12 秒不变 且 非我方回合，或检测到底部弹出按钮区域亮度突增」。真机实测 JJ象棋陪练单步能想两分钟以上，**棋盘没动推不出对局结束** —— 现在只认一个信号：棋盘从画面上消失超过 `BOARD_LOST_TIMEOUT_S = 10.0` 秒。想看门狗就把 `session.opponent_idle_sec` 设成秒数，超时**只暂停**，绝不判终局。
+
+**连下多局**：终局之后不退出，而是等结算画面出现 —— 判据是底部那条带的颜色（`is_result_screen()`：绿通道 ≥ 140 且绿减蓝 ≥ 60；真机实测结算画面 G=185.0/B=94.9，对局中同一处 G=82.4/B=70.6）—— 认出之后按客户区比例点 `(0.502, 0.910)` 处的「再来一局」，再等新棋盘出现（`locate()` 成功）就开下一局。**认不出就不点**：同一位置在对局中是棋盘，盲点等于自己乱走一步，这时打印提示并收工。`--rounds N` 限定局数（`0` = 一直下），每局各写一份记谱。
 
 ### 4.9 `src/jjchess/record.py` —— 对局记录与中文记谱导出
 
@@ -404,7 +406,7 @@ ICCS: h2e2 h9g7 h0g2
 ```
 uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
-               [--human-delay [MIN-MAX]] [--no-record]
+               [--human-delay [MIN-MAX]] [--no-record] [--rounds N]
 ```
 
 主循环：`grab → locate(首帧) → recognize → session.step → panel.render → hotkeys` 循环，目标 4~6 FPS。

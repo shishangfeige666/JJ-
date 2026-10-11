@@ -31,11 +31,38 @@ def _key_state(vk: int) -> int:
 
 
 class Hotkeys:
-    """真实热键源。`key_state` 可注入，测试不必真的按键。"""
+    """真实热键源。`key_state` 可注入，测试不必真的按键。
 
-    def __init__(self, key_state: Callable[[int], int] | None = None) -> None:
+    `clear_latches` 默认「用真源就清、用假源就不清」：清锁存位要额外问一遍每个键，
+    而按帧脚本的替身（`tests/test_panel.py` 里那两个）多问几次就打乱了它的节奏。
+    """
+
+    def __init__(
+        self,
+        key_state: Callable[[int], int] | None = None,
+        *,
+        clear_latches: bool | None = None,
+    ) -> None:
         self._key_state = _key_state if key_state is None else key_state
         self._held: set[str] = set()
+        if clear_latches is None:
+            clear_latches = key_state is None
+        if clear_latches:
+            self._clear_latches()
+
+    def _clear_latches(self) -> None:
+        """启动时把四个键问一遍，清掉可能残留的「上次查询之后按下过」锁存位。
+
+        最低位是**会话级**的：上一次运行（或别的程序）里按下的键，只要之后没人
+        查过这个键，锁存位就一直留着。新进程第一次 `poll()` 会把它当成「刚按下」，
+        于是脚本一启动就自己切进彩排模式 —— 真机反馈正是「F10 默认是开的」。
+        ESC 更要命：残留的锁存位会让脚本刚起来就退出。
+
+        顺手把「启动时本来就按住的键」记成已按住，等松开再按才算数。
+        """
+        for name, vk in _KEYS.items():
+            if self._key_state(vk) & 0x8000:
+                self._held.add(name)
 
     def poll(self) -> set[str]:
         """返回本帧**新按下**的键名集合（按住不放不会重复返回）。

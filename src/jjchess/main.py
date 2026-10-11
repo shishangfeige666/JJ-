@@ -108,6 +108,25 @@ EXIT_USAGE = 2
 EXIT_NO_WINDOW = 2
 EXIT_NO_FRAME = 3
 
+# 「再来一局」按钮的位置与颜色特征（都按客户区尺寸的比例算，换分辨率也认得出）。
+#
+# 一局下完游戏会弹结算画面，绿色的「再来一局」按钮固定在底部中间。要连着下，
+# 就得先**认出**这个画面再点 —— 不能盲点：同一个位置在对局中是空棋盘，在大厅里
+# 可能是别的按钮，点错了比不点更糟。
+RESULT_BAND_Y = 0.910
+RESULT_BAND_X = (0.30, 0.70)
+PLAY_AGAIN_POINT = (0.502, 0.910)
+#: 按钮的绿色通道下限，以及「绿比蓝至少要高出多少」。
+#: 真机实测：结算画面 G=172.7 / B=90.5（差 82.2），对局中同一处 G=82.4 / B=70.6（差 11.8）。
+RESULT_GREEN_MIN = 140.0
+RESULT_GREEN_GAP = 60.0
+#: 等结算画面出现、等新一局棋盘出现，各给多久。
+RESULT_WAIT_S = 15.0
+NEW_BOARD_WAIT_S = 20.0
+#: 认出来的棋盘上至少要有这么多子才算「真棋盘」。
+#: `locate()` 会被空的装饰棋盘骗到（见主循环里那段注释），所以定位成功之后还得数一数。
+MIN_PIECES_ON_BOARD = 2
+
 
 # ================================================================ 命令行
 
@@ -133,6 +152,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-panel", action="store_true", help="不显示实时可视化面板")
     parser.add_argument("--no-record", action="store_true", help="不导出中文记谱文件")
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=0,
+        metavar="N",
+        help="连下多少局后退出；0（默认）表示一直下，直到 ESC 或出错。每局单独出一份记谱",
+    )
     parser.add_argument("--calibrate", action="store_true", help="运行标定工具（抓帧建模板）后退出")
     parser.add_argument("--debug-dir", default=None, help="调试产物（记谱、坏帧）写到这个目录")
     parser.add_argument(
@@ -523,6 +549,82 @@ def _handle_delay_hotkeys(keys: set[str], session: Session, mouse: Mouse) -> Non
             print("收到退出指令（ESC）")
 
 
+def is_result_screen(img) -> bool:
+    """画面底部那个绿色的「再来一局」按钮在不在。
+
+    只看颜色不看文字：按钮是一块很大、很饱和的亮绿，对局中同一位置是空棋盘
+    （暗绿木头色），两者差得远 —— 真机实测绿通道 172.7 vs 82.4，绿蓝差 82.2 vs 11.8。
+    """
+    if img is None:
+        return False
+    height, width = img.shape[:2]
+    y = int(RESULT_BAND_Y * height)
+    x0, x1 = int(RESULT_BAND_X[0] * width), int(RESULT_BAND_X[1] * width)
+    band = img[max(0, y - 12) : y + 12, x0:x1]
+    if band.size == 0:
+        return False
+    blue, green, _red = (float(v) for v in band.reshape(-1, 3).mean(axis=0))
+    return green >= RESULT_GREEN_MIN and green - blue >= RESULT_GREEN_GAP
+
+
+def _next_round(window, hotkeys: Hotkeys, mouse: Mouse):
+    """一局结束后开下一局：等结算画面 → 点「再来一局」→ 等新棋盘出现。
+
+    成功返回新一局的 `BoardGeometry`；用户按了 ESC、或者等不到该等的东西，返回 `None`
+    （调用方据此收工）。**每一步都有超时** —— 上一局结束时棋盘就是消失的，看不出
+    「点击没生效」和「还在加载」的区别，不设上限就会一直空转。
+    """
+    if getattr(mouse, "dry_run", False):
+        print("彩排模式不会真的点鼠标，不再自动开新局。")
+        return None
+
+    print("准备下一局：等结算画面…")
+    deadline = time.monotonic() + RESULT_WAIT_S
+    img = None
+    while time.monotonic() < deadline:
+        if "quit" in hotkeys.poll():
+            print("收到退出指令（ESC），不再开新局。")
+            return None
+        frame = grab_usable(window)
+        if frame is not None and is_result_screen(frame):
+            img = frame
+            break
+        time.sleep(0.3)
+    if img is None:
+        print("等不到「再来一局」按钮，不再自动开新局。", file=sys.stderr)
+        return None
+
+    height, width = img.shape[:2]
+    mouse.click_client(
+        int(PLAY_AGAIN_POINT[0] * width),
+        int(PLAY_AGAIN_POINT[1] * height),
+        window.client_origin,
+    )
+    print("已点「再来一局」，等新一局开始…")
+
+    deadline = time.monotonic() + NEW_BOARD_WAIT_S
+    while time.monotonic() < deadline:
+        if "quit" in hotkeys.poll():
+            print("收到退出指令（ESC），不再开新局。")
+            return None
+        frame = grab_usable(window)
+        if frame is not None:
+            try:
+                geom = locate(frame)
+            except BoardNotFound:
+                pass
+            else:
+                # 切到对局之前游戏会先过一屏「正在匹配」，那上面有一块**空的**装饰
+                # 棋盘，`locate()` 照样拟得出网格（真机实测格距 102.7 vs 真棋盘 125.8）。
+                # 认下来的话，第二局会一直卡在 IDLE 里等一个永远等不到的开局。
+                if count_pieces(frame, geom) >= MIN_PIECES_ON_BOARD:
+                    print(f"新一局棋盘定位：{geom}")
+                    return geom
+        time.sleep(0.3)
+    print("点了「再来一局」却等不到棋盘，不再自动开新局。", file=sys.stderr)
+    return None
+
+
 def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     hotkeys = Hotkeys()
     ready = _wait_for_board(args, cfg, window, hotkeys)
@@ -534,28 +636,38 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     if args.dry_run:
         print("彩排模式：不会真的点鼠标（F10 可随时切换）")
 
-    started = dt.datetime.now()
-    recorder = GameRecorder(my_side, START_FEN, started) if cfg.record else None
-
     latest: dict[str, Board | None] = {"board": rec.board}
-    session = Session(
-        SessionDeps(
-            board_provider=lambda: latest["board"],
-            engine=engine,
-            mouse=mouse,
-            mapper=mapper,
-            recorder=recorder,
-            config=cfg,
-            geometry_provider=lambda: screen_geometry(geom, window.client_origin),
-        )
-    )
     panel = Panel(enabled=not args.no_panel)
 
-    # 拟人延迟期间也要能按 F8 / ESC：主循环那时正阻塞在 `session.step()` 里面，
-    # 没有别的地方会去读键盘。挂在构造之后，是因为回调要引用 `session` 本身。
-    session.deps.delay_tick = lambda: _handle_delay_hotkeys(hotkeys.poll(), session, mouse)
+    def new_round() -> tuple[Session, GameRecorder | None, dt.datetime]:
+        """开一局新的：新的会话 + 新的记谱。
+
+        每局都得换一份 `GameRecorder`，否则第二局的着法会追加到第一局的文件里；
+        会话也必须从 `IDLE` 重新起，不然它带着上一局的模型去认新一局的开局。
+        """
+        started_at = dt.datetime.now()
+        rec_obj = GameRecorder(my_side, START_FEN, started_at) if cfg.record else None
+        sess = Session(
+            SessionDeps(
+                board_provider=lambda: latest["board"],
+                engine=engine,
+                mouse=mouse,
+                mapper=mapper,
+                recorder=rec_obj,
+                config=cfg,
+                geometry_provider=lambda: screen_geometry(geom, window.client_origin),
+            )
+        )
+        # 拟人延迟期间也要能按 F8 / ESC：主循环那时正阻塞在 `session.step()` 里面，
+        # 没有别的地方会去读键盘。绑在**这一局自己的** session 上，不跟着外面的变量跑。
+        sess.deps.delay_tick = lambda: _handle_delay_hotkeys(hotkeys.poll(), sess, mouse)
+        return sess, rec_obj, started_at
+
+    session, recorder, started = new_round()
 
     print("开始对局。热键：F8 暂停/继续，F9 单步，F10 彩排，ESC 退出。")
+    if not args.rounds:
+        print("下完一局会自动点「再来一局」接着下；想只下一局用 --rounds 1。")
     bad_streak = 0
     last_state: State | None = None
     last_fen: str | None = None
@@ -564,6 +676,8 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     settle = FrameSettle()
     last_locate = time.monotonic()
     exit_code = EXIT_OK
+    finished = 0
+    saved = False
     try:
         while not session.should_stop:
             _handle_hotkeys(hotkeys.poll(), session, mouse)
@@ -577,7 +691,28 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 # 时的早退分支），末尾的判断会被它绕过去 —— 真机上就卡在这里空转。
                 # 放在开头，无论从哪条路走到终局，下一轮都会收尾。
                 print(f"对局结束（{session.message}），正在收尾…")
-                break
+                _finish(session, recorder, cfg, started)
+                saved = True
+                finished += 1
+                if args.rounds and finished >= args.rounds:
+                    print(f"已下满 {finished} 局（--rounds {args.rounds}），收工。")
+                    break
+                geom = _next_round(window, hotkeys, mouse)
+                if geom is None:
+                    break
+                # 开下一局：会话、记谱、逐帧状态全部重置。
+                latest["board"] = None
+                settle.reset()
+                last_state = None
+                last_fen = None
+                dumped = False
+                board_lost = False
+                bad_streak = 0
+                last_locate = time.monotonic()
+                session, recorder, started = new_round()
+                saved = False
+                print(f"第 {finished + 1} 局开始。")
+                continue
 
             img = grab_usable(window)
             if img is None:
@@ -625,9 +760,7 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     geom = None
             if geom is None:
                 try:
-                    geom = locate(img)
-                    last_locate = time.monotonic()
-                    print(f"棋盘重新定位：{geom}")
+                    found = locate(img)
                 except BoardNotFound:
                     latest["board"] = None
                     rec = None
@@ -636,6 +769,21 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     panel.render(img, None, None, session)
                     time.sleep(0.5)
                     continue
+                if count_pieces(img, found) < MIN_PIECES_ON_BOARD:
+                    # 定位成功 ≠ 找到了棋盘。「正在匹配」那类页面上画着一块**空的**
+                    # 装饰棋盘，`locate()` 照样能拟出网格来（真机实测格距 102.7，
+                    # 真棋盘是 125.8）。拿它去认只会得到一盘空棋，然后会话就卡在
+                    # IDLE 里等一个永远等不到的开局。棋盘上总得有子，没子就不是。
+                    latest["board"] = None
+                    rec = None
+                    session.step()
+                    last_state = log_state(session, last_state)
+                    panel.render(img, None, None, session)
+                    time.sleep(0.5)
+                    continue
+                geom = found
+                last_locate = time.monotonic()
+                print(f"棋盘重新定位：{geom}")
 
             try:
                 rec = recognize(
@@ -703,7 +851,9 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     finally:
         # 收尾放在 `finally` 里，任何一条退出路径都跑得到。
         panel.close()
-        _finish(session, recorder, cfg, started)
+        # 终局那条路已经自己收过尾了（还要留着进程去开下一局），别重复写一遍文件。
+        if not saved:
+            _finish(session, recorder, cfg, started)
     return exit_code
 
 
@@ -734,6 +884,10 @@ def main(argv: list[str] | None = None) -> int:
     """程序主入口，返回进程退出码：0 正常，2 参数/窗口问题，3 抓不到画面。"""
     raw = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(raw)
+
+    if args.rounds < 0:
+        print("错误：--rounds 不能是负数（0 表示一直下，直到 ESC 或出错）。", file=sys.stderr)
+        return EXIT_USAGE
 
     if args.calibrate:
         return _run_calibrate(["--build"])

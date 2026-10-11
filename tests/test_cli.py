@@ -18,8 +18,10 @@ from jjchess.config import DEFAULT_HUMAN_DELAY, Config, parse_human_delay
 from jjchess.engine.uci import Analysis
 from jjchess.geometry import BLACK, RED, BoardGeometry, ScreenMapper
 from jjchess.main import (
+    EXIT_NO_FRAME,
     EXIT_OK,
     FrameSettle,
+    _next_round,
     _play,
     build_parser,
     count_pieces,
@@ -604,3 +606,265 @@ def test_棋盘定位不到时终局也要收尾(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "对局结束" in out
 
+
+# ================================================================ 多轮对局
+
+
+class _StubMouse:
+    """鼠标桩：记录点了哪里，绝不真的动系统光标。"""
+
+    def __init__(self, dry_run: bool = False, my_side: int = RED) -> None:
+        self.dry_run = dry_run
+        self.my_side = my_side
+        self.clicks: list[tuple[int, int]] = []
+
+    def click_client(self, x: int, y: int, origin) -> None:
+        self.clicks.append((x, y))
+
+    def move_to(self, *_a, **_k) -> None:
+        pass
+
+    def play_move(self, *_a, **_k) -> None:
+        pass
+
+
+class _QuickSettle:
+    """画面稳定闸门桩：立刻放行。真闸门要等 0.5 秒，测试里没这个时间。"""
+
+    def feed(self, _fen: str, _now: float) -> bool:
+        return True
+
+    def reset(self) -> None:
+        pass
+
+
+def test_认出结算画面的再来一局按钮():
+    """绿色「再来一局」按钮要认得出来 —— 认不出就没法连着下，认错了更糟。
+
+    判定只看底部那条带的颜色。真机实测：结算画面 G=185.0 / B=94.9（差 90.1），
+    对局中同一处 G=82.4 / B=70.6（差 11.8），大厅是 G=92.4 / B=54.6。
+    """
+    from jjchess.main import is_result_screen
+
+    def load(name: str):
+        return cv2.imdecode(np.fromfile(FIXTURES / name, np.uint8), cv2.IMREAD_COLOR)
+
+    assert is_result_screen(load("result.png")), "结算画面应该认得出来"
+    for name in ("opening.png", "mid_01.png", "lobby.png"):
+        assert not is_result_screen(load(name)), f"{name} 不是结算画面"
+    assert not is_result_screen(None)
+
+    # 再钉一遍数值：绿色通道和「绿减蓝」两个门槛都得真起作用。
+    blank = np.zeros((2560, 1440, 3), np.uint8)
+    y = int(0.910 * 2560)
+    band = (slice(y - 12, y + 12), slice(432, 1008))
+    blank[band] = (70, 82, 81)  # 对局中的木头色
+    assert not is_result_screen(blank)
+    blank[band] = (90, 172, 164)  # 结算画面的按钮绿
+    assert is_result_screen(blank)
+    blank[band] = (90, 130, 200)  # 够绿但绿蓝差不够（比如偏蓝的其它按钮）
+    assert not is_result_screen(blank)
+
+
+def _patch_round_loop(monkeypatch, geom, rec, tmp_path, extra: list[str]):
+    """把主循环的一局做成「一帧有棋盘，然后一直认不到」的桩。"""
+    ctl = {"give": 1, "grab": 0}
+    starts: list[int] = []
+
+    def fake_recognize(*_a, **_k):
+        if ctl["give"] > 0:
+            ctl["give"] -= 1
+            return rec
+        return None
+
+    def fake_grab(*_a, **_k):
+        ctl["grab"] += 1
+        return _good() if ctl["grab"] <= 200 else None
+
+    monkeypatch.setattr("jjchess.main.recognize", fake_recognize)
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+    monkeypatch.setattr("jjchess.main.Hotkeys", _NoKeys)
+    monkeypatch.setattr("jjchess.main.LOOP_SLEEP", 0.0)
+    monkeypatch.setattr("jjchess.main.MAX_BAD_STREAK", 3)
+    monkeypatch.setattr("jjchess.main.FrameSettle", _QuickSettle)
+    monkeypatch.setattr("jjchess.session.BOARD_LOST_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(
+        "jjchess.main._wait_for_board",
+        lambda *_a, **_k: (None, geom, rec, ScreenMapper(RED), None, RED),
+    )
+    monkeypatch.setattr("jjchess.main.Mouse", _StubMouse)
+    args = build_parser().parse_args(
+        ["--no-panel", "--debug-dir", str(tmp_path), *extra]
+    )
+    return args, ctl, starts
+
+
+def test_只下一局时不碰再来一局(tmp_path, monkeypatch, capsys):
+    """`--rounds 1` 是旧行为：下完一局收工，绝不去点结算画面。"""
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    args, _ctl, _starts = _patch_round_loop(monkeypatch, geom, rec, tmp_path, ["--rounds", "1"])
+
+    called: list[int] = []
+    monkeypatch.setattr(
+        "jjchess.main._next_round", lambda *_a, **_k: called.append(1) or geom
+    )
+
+    assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_OK
+    assert called == [], "--rounds 1 不该去开新局"
+    out = capsys.readouterr().out
+    assert "对局结束" in out
+    assert "已下满 1 局" in out
+
+
+def test_默认下完一局自动开下一局(tmp_path, monkeypatch, capsys):
+    """默认（`--rounds 0`）要连着下：终局之后去点「再来一局」。"""
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    args, _ctl, _starts = _patch_round_loop(monkeypatch, geom, rec, tmp_path, [])
+
+    called: list[int] = []
+    # 第二局开不起来（返回 None）→ 循环收工。这条测试只关心「有没有去开」。
+    monkeypatch.setattr("jjchess.main._next_round", lambda *_a, **_k: called.append(1))
+
+    assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_OK
+    assert called == [1], "终局之后应该去开新局"
+
+
+def test_再来一局后第二局用新的会话与记谱(tmp_path, monkeypatch, capsys):
+    """连着下时，第二局必须是全新的会话 + 全新的记谱。
+
+    复用会话的话，它会带着上一局的模型去认新一局的开局；复用记谱的话，
+    第二局的着法会追加进第一局的文件里。
+    """
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    args, ctl, _starts = _patch_round_loop(
+        monkeypatch, geom, rec, tmp_path, ["--rounds", "2"]
+    )
+    seen: list[object] = []
+
+    def fake_next_round(*_a, **_k):
+        seen.append(1)
+        ctl["give"] = 1  # 新一局的开局能看见一帧
+        return geom
+
+    monkeypatch.setattr("jjchess.main._next_round", fake_next_round)
+
+    assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_OK
+    out = capsys.readouterr().out
+    assert seen == [1], "应该只开一次新局（下满 2 局就收工）"
+    assert "第 2 局开始" in out
+    assert "已下满 2 局" in out
+    assert out.count("，正在收尾…") == 2, "两局都要各自收一次尾"
+
+
+def test_等不到结算画面就收工(tmp_path, monkeypatch, capsys):
+    """点不到「再来一局」时**宁可收工也不能盲点** —— 那个位置在对局中是棋盘。"""
+    mouse = _StubMouse()
+    monkeypatch.setattr("jjchess.main.grab_usable", lambda *_a, **_k: _good())
+    monkeypatch.setattr("jjchess.main.RESULT_WAIT_S", 0.0)
+
+    assert _next_round(_LoopWindow(), _NoKeys(), mouse) is None
+    assert mouse.clicks == [], "认不出结算画面就不该点下去"
+    assert "等不到" in capsys.readouterr().err
+
+
+def test_彩排模式不自动开新局(tmp_path, monkeypatch, capsys):
+    """彩排本来就没真点鼠标，新一局不会开始，别在那里空等 20 秒。"""
+    mouse = _StubMouse(dry_run=True)
+    monkeypatch.setattr("jjchess.main.grab_usable", lambda *_a, **_k: _good())
+
+    assert _next_round(_LoopWindow(), _NoKeys(), mouse) is None
+    assert mouse.clicks == []
+    assert "彩排模式" in capsys.readouterr().out
+
+
+def test_认出结算画面后点再来一局并等新棋盘(tmp_path, monkeypatch, capsys):
+    """完整的一轮：认出按钮 → 点它 → 等新棋盘出现 → 把新几何交回去。"""
+    from jjchess.main import PLAY_AGAIN_POINT
+
+    geom = _FAKE_GEOM
+    result = cv2.imdecode(
+        np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR
+    )
+    mouse = _StubMouse()
+    frames = {"n": 0}
+
+    def fake_grab(*_a, **_k):
+        frames["n"] += 1
+        # 前两帧是结算画面，之后新一局的棋盘出来了。
+        return result if frames["n"] <= 2 else _good()
+
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+
+    got = _next_round(_LoopWindow(), _NoKeys(), mouse)
+    assert got is geom
+    assert len(mouse.clicks) == 1
+    x, y = mouse.clicks[0]
+    assert (x, y) == (
+        int(PLAY_AGAIN_POINT[0] * result.shape[1]),
+        int(PLAY_AGAIN_POINT[1] * result.shape[0]),
+    )
+    out = capsys.readouterr().out
+    assert "已点「再来一局」" in out
+    assert "新一局棋盘定位" in out
+
+def test_空的装饰棋盘不算找到棋盘(tmp_path, monkeypatch, capsys):
+    """`locate()` 会在「正在匹配」那类页面的空棋盘上拟出网格。
+
+    真机实测：点完「再来一局」游戏先过一屏「正在匹配」，那上面一块**空的**装饰棋盘
+    被 `locate()` 认了出来（格距 102.7，真棋盘 125.8）。认下来的话第二局会一直卡在
+    IDLE 里等一个永远等不到的开局 —— 真机就是这么卡住的。
+    """
+    geom = _FAKE_GEOM
+    result = cv2.imdecode(np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR)
+    mouse = _StubMouse()
+    frames = {"n": 0}
+
+    def fake_grab(*_a, **_k):
+        frames["n"] += 1
+        return result if frames["n"] <= 1 else _good()
+
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 0)
+    monkeypatch.setattr("jjchess.main.NEW_BOARD_WAIT_S", 0.0)
+
+    assert _next_round(_LoopWindow(), _NoKeys(), mouse) is None
+    assert "等不到棋盘" in capsys.readouterr().err
+
+
+def test_主循环里空棋盘也不认(tmp_path, monkeypatch, capsys):
+    """主循环同样：定位成功但盘上一颗子都没有，就当没找到棋盘，别拿去识别。"""
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    calls = {"recognize": 0, "grab": 0}
+
+    def fake_recognize(*_a, **_k):
+        calls["recognize"] += 1
+        return rec
+
+    def fake_grab(*_a, **_k):
+        calls["grab"] += 1
+        return _good() if calls["grab"] <= 8 else None
+
+    monkeypatch.setattr("jjchess.main.recognize", fake_recognize)
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 0)
+    monkeypatch.setattr("jjchess.main.Hotkeys", _NoKeys)
+    monkeypatch.setattr("jjchess.main.LOOP_SLEEP", 0.0)
+    monkeypatch.setattr("jjchess.main.MAX_BAD_STREAK", 3)
+    monkeypatch.setattr(
+        "jjchess.main._wait_for_board",
+        # 首帧就没有几何 —— 逼主循环自己走一遍「定位 → 数子 → 认不认」。
+        lambda *_a, **_k: (None, None, rec, ScreenMapper(RED), None, RED),
+    )
+    args = build_parser().parse_args(["--no-panel", "--rounds", "1", "--debug-dir", str(tmp_path)])
+
+    assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_NO_FRAME
+    assert calls["recognize"] == 0, "空棋盘不该拿去识别"
+    assert "棋盘重新定位" not in capsys.readouterr().out
