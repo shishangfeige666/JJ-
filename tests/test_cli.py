@@ -696,9 +696,7 @@ def _patch_round_loop(monkeypatch, geom, rec, tmp_path, extra: list[str]):
         lambda *_a, **_k: (None, geom, rec, ScreenMapper(RED), None, RED),
     )
     monkeypatch.setattr("jjchess.main.Mouse", _StubMouse)
-    args = build_parser().parse_args(
-        ["--no-panel", "--debug-dir", str(tmp_path), *extra]
-    )
+    args = build_parser().parse_args(["--no-panel", "--debug-dir", str(tmp_path), *extra])
     return args, ctl, starts
 
 
@@ -709,9 +707,7 @@ def test_只下一局时不碰再来一局(tmp_path, monkeypatch, capsys):
     args, _ctl, _starts = _patch_round_loop(monkeypatch, geom, rec, tmp_path, ["--rounds", "1"])
 
     called: list[int] = []
-    monkeypatch.setattr(
-        "jjchess.main._next_round", lambda *_a, **_k: called.append(1) or geom
-    )
+    monkeypatch.setattr("jjchess.main._next_round", lambda *_a, **_k: called.append(1) or geom)
 
     assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_OK
     assert called == [], "--rounds 1 不该去开新局"
@@ -742,9 +738,7 @@ def test_再来一局后第二局用新的会话与记谱(tmp_path, monkeypatch,
     """
     geom = _FAKE_GEOM
     rec = _loop_recognition()
-    args, ctl, _starts = _patch_round_loop(
-        monkeypatch, geom, rec, tmp_path, ["--rounds", "2"]
-    )
+    args, ctl, _starts = _patch_round_loop(monkeypatch, geom, rec, tmp_path, ["--rounds", "2"])
     seen: list[object] = []
 
     def fake_next_round(*_a, **_k):
@@ -788,9 +782,7 @@ def test_认出结算画面后点再来一局并等新棋盘(tmp_path, monkeypat
     from jjchess.main import PLAY_AGAIN_POINT
 
     geom = _FAKE_GEOM
-    result = cv2.imdecode(
-        np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR
-    )
+    result = cv2.imdecode(np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR)
     mouse = _StubMouse()
     frames = {"n": 0}
 
@@ -813,6 +805,7 @@ def test_认出结算画面后点再来一局并等新棋盘(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "已点「再来一局」" in out
     assert "新一局棋盘定位" in out
+
 
 def test_空的装饰棋盘不算找到棋盘(tmp_path, monkeypatch, capsys):
     """`locate()` 会在「正在匹配」那类页面的空棋盘上拟出网格。
@@ -883,23 +876,15 @@ def test_几何只偏一点点就换过去():
     真机实测：第 2 局的几何是 `origin=(101.61, 602.69), dx=154.56`，正常应当是
     `origin≈(101.5, 609.3)` —— 纵向偏了 6 像素。
     """
-    old = BoardGeometry(
-        origin=(101.607, 602.686), dx=154.558, dy=148.012, cell_px=125.810
-    )
-    better = BoardGeometry(
-        origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850
-    )
+    old = BoardGeometry(origin=(101.607, 602.686), dx=154.558, dy=148.012, cell_px=125.810)
+    better = BoardGeometry(origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850)
     assert geom_close(better, old)
 
 
 def test_装饰棋盘的几何不算同一个棋盘():
     """「正在匹配」页面上那块空棋盘拟合出来的格距只有 121，差得太多，绝不能换过去。"""
-    real = BoardGeometry(
-        origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850
-    )
-    fake = BoardGeometry(
-        origin=(241.30, 380.44), dx=121.35, dy=120.77, cell_px=102.65
-    )
+    real = BoardGeometry(origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850)
+    fake = BoardGeometry(origin=(241.30, 380.44), dx=121.35, dy=120.77, cell_px=102.65)
     assert not geom_close(fake, real)
 
 
@@ -926,9 +911,7 @@ def test_认不出来的格子会换个几何再认一遍(monkeypatch):
     monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 16)
     monkeypatch.setattr("jjchess.main.recognize", lambda *_a, **_k: clean)
 
-    got = _retry_unknown(
-        _good(), stale, None, ScreenMapper(RED), Config(), dirty
-    )
+    got = _retry_unknown(_good(), stale, None, ScreenMapper(RED), Config(), dirty)
     assert got is clean, "换个几何认干净了就该用新的那份"
 
 

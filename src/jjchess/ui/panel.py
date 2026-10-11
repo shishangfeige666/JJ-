@@ -88,6 +88,10 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ("等待对局开始…", "waiting for game to start..."),
     ("检测到开局局面", "opening position detected"),
     ("走子已确认", "move confirmed"),
+    (
+        "这一步好像没点上，重按一次（第",
+        "click did not register, retrying #",
+    ),
     ("对方走 ", "opponent played "),
     ("已走 ", "played "),
     ("走 ", "played "),

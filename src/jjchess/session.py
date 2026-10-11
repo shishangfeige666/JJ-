@@ -50,6 +50,7 @@ if TYPE_CHECKING:  # pragma: no cover - 只为类型标注
 
 __all__ = [
     "BOARD_LOST_TIMEOUT_S",
+    "CLICK_RETRIES",
     "MAX_UNEXPLAINED",
     "VERIFY_TIMEOUT_S",
     "Session",
@@ -71,6 +72,15 @@ MAX_UNEXPLAINED = 3
 #: 逐帧抓到的局面在两三个变体之间来回跳，实测要 2~3 秒才停稳，
 #: 再留 0.3 秒给画面稳定闸门，2.5 秒正好卡在边缘上（真机踩过）。
 VERIFY_TIMEOUT_S = 5.0
+#: 一步点下去画面**纹丝不动**时，重按几次再认输。
+#:
+#: 真机实测（`_probe/e2e/run14.log`，19:53:13）：脚本点了「車 h7→f7」，
+#: 选中光晕闪了一下，5 秒后画面还是原样 —— 吃子没发生。这时候直接
+#: 「点击后局面校验失败，已暂停」在无人看管时等于白等一整局。
+#:
+#: 重按是**安全**的：只有画面完完全全等于走子之前才重按（见 `_retry_click`），
+#: 所以重按的是同一着、同一个起点，不可能把棋下歪。
+CLICK_RETRIES = 2
 #: 棋盘「读不到」多久就判定对局结束（秒）。
 #:
 #: 真机实测：我方用双車做成绝杀之后，游戏立刻切到结算画面（大红的「再来一局」），
@@ -347,9 +357,7 @@ class Session:
                 self._record_move(self.board, mv)
                 self._adopt(mv, opponent=False)
                 return
-            self._count_unexplained(
-                cur, State.MY_TURN, "看不懂局面变化，已暂停（请检查识别）"
-            )
+            self._count_unexplained(cur, State.MY_TURN, "看不懂局面变化，已暂停（请检查识别）")
             return
         if self._check_idle():
             return
@@ -402,6 +410,7 @@ class Session:
 
         self._pending_move = mv
         self._board_before = board.copy()
+        self._click_retries = 0
         self.state = State.PLAYING
 
     def _step_playing(self) -> None:
@@ -484,6 +493,9 @@ class Session:
             # 棋子是滑过去的，动画没放完就判失败会误伤（真机踩过）。
             return
 
+        if self._retry_click(mv, before, cur):
+            return
+
         if getattr(self.deps.mouse, "dry_run", False):
             # 彩排时本来就没点鼠标，局面当然不会变 —— 这不算故障，别吓唬人。
             msg = "彩排：没真的点鼠标，局面不会变，已暂停（按 F10 关闭彩排）"
@@ -491,6 +503,34 @@ class Session:
             msg = "点击后局面校验失败，已暂停"
         # 画面没变成预期 → 这一步当没走过，恢复后重新决策（`self.board` 也没动）。
         self._auto_pause(State.MY_TURN, msg)
+
+    def _retry_click(self, mv: str, before, cur) -> bool:
+        """这一步点了、画面却纹丝没动时，重按一次，而不是立刻收摊。
+
+        真机实测（`_probe/e2e/run14.log`）：`h7f7` 那步的車原地不动，
+        选中光晕闪了一下就没了 —— 合成点击偶尔会被游戏漏掉。此时画面
+        **完完全全等于走子之前**，所以重按同一着绝不会把棋下歪；
+        反过来，只要画面动过（对方的还着、或者别的意外），那就不叫
+        「没点上」，一律不重按。
+
+        重按有额度（`CLICK_RETRIES` 次），额度用完还不行，才由调用方报
+        「点击后局面校验失败」。返回 `True` 表示已经重按、继续在 `VERIFY` 里等。
+        """
+        if getattr(self.deps.mouse, "dry_run", False):
+            return False
+        if _grid_diff(cur, before) != 0:
+            return False
+        tries = getattr(self, "_click_retries", 0)
+        if tries >= CLICK_RETRIES:
+            return False
+        geom = self.deps.geometry_provider() if self.deps.geometry_provider else None
+        if geom is None:
+            return False
+        self._click_retries = tries + 1
+        self.deps.mouse.play_move(mv, geom)
+        self._play_at = self.deps.now()
+        self.message = f"这一步好像没点上，重按一次（第 {self._click_retries} 次）"
+        return True
 
     def _step_opponent_turn(self) -> None:
         # 静止计时先判：抓图一直失败（窗口最小化/被关掉）本身也是一种"对方没动"，
@@ -607,9 +647,7 @@ class Session:
         if self.deps.now() - self._idle_since <= limit:
             return False
         if self.state is State.OPPONENT_TURN:
-            self._auto_pause(
-                State.OPPONENT_TURN, "对方长时间没走棋，已暂停（按 F8 继续等待）"
-            )
+            self._auto_pause(State.OPPONENT_TURN, "对方长时间没走棋，已暂停（按 F8 继续等待）")
             return True
         self._auto_pause(State.MY_TURN, "轮到我方但局面异常静止，请检查（按 F8 继续）")
         return True

@@ -213,9 +213,7 @@ class Board:
         if not (7 <= black_rank <= 9 and _PALACE_MIN <= black_file <= _PALACE_MAX):
             return False
         # 照面：同一纵线且中间一个子都没有。
-        facing = red_file == black_file and not self.grid[
-            red_rank + 1 : black_rank, red_file
-        ].any()
+        facing = red_file == black_file and not self.grid[red_rank + 1 : black_rank, red_file].any()
         return not facing
 
     # ---- 单点访问 ----

@@ -27,6 +27,7 @@ from jjchess.rules.board import START_FEN, Board
 from jjchess.rules.moves import legal_moves, make
 from jjchess.session import (
     BOARD_LOST_TIMEOUT_S,
+    CLICK_RETRIES,
     MAX_UNEXPLAINED,
     VERIFY_TIMEOUT_S,
     Session,
@@ -140,7 +141,9 @@ def test_睡眠每一小片都会跑一次tick():
     不给 `tick` 的话 `stop()` 永远看不到新按键，只能睡满（真机上按 F8 等了 3.4 秒）。
     """
     ticks = {"n": 0}
-    ok = interruptible_sleep(0.3, lambda: False, slice_s=0.05, tick=lambda: ticks.__setitem__("n", ticks["n"] + 1))
+    ok = interruptible_sleep(
+        0.3, lambda: False, slice_s=0.05, tick=lambda: ticks.__setitem__("n", ticks["n"] + 1)
+    )
     assert ok is True
     # 0.3 秒切 0.05 秒的片，至少要跑好几次；给个宽松下界，别把实现钉死。
     assert ticks["n"] >= 5
@@ -186,6 +189,22 @@ class _FakeEngine:
 
     def __exit__(self, *exc):
         return None
+
+
+class _CountingMouse:
+    """只记账、真不点的鼠标替身。
+
+    真机实测（`_probe/e2e/run14.log`）里出现过「点了没反应」：脚本点了
+    「車 h7→f7」，选中光晕闪了一下就没了，画面纹丝不动。所以要能数清楚
+    到底点了几次。
+    """
+
+    def __init__(self) -> None:
+        self.dry_run = False
+        self.moves: list[str] = []
+
+    def play_move(self, mv, geom) -> None:
+        self.moves.append(mv)
 
 
 class _Provider:
@@ -428,6 +447,58 @@ def test_走子后局面校验失败会暂停():
     s.step()
     assert s.state is State.PAUSED
     assert "校验失败" in s.message
+
+
+def test_点了没反应会自动重按一次():
+    """画面**完完全全等于走子之前**时，重按同一着是安全的。
+
+    真机实测（run14，19:53:13）：脚本点了「車 h7→f7」，选中光晕闪了一下就没了，
+    5 秒后画面还是原样 —— 这一步根本没点上。一次不成就报「已暂停」，
+    在无人看管连下多局时等于白等一整局，所以自动重按，额度用完才认输。
+    """
+    start = Board.from_fen(START_FEN)
+    p = _Provider(start)
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    mouse = _CountingMouse()
+    s.deps.mouse = mouse
+
+    _run_until(s, State.VERIFY)
+    assert len(mouse.moves) == 1, "第一步总得先点一次"
+
+    clock.advance(VERIFY_TIMEOUT_S + 0.1)
+    s.step()  # 画面纹丝不动
+    assert s.state is State.VERIFY, "该重按，而不是立刻暂停"
+    assert len(mouse.moves) == 2, "该重按同一着"
+    assert mouse.moves[0] == mouse.moves[1]
+    assert "重按" in s.message
+
+    for _ in range(CLICK_RETRIES):
+        clock.advance(VERIFY_TIMEOUT_S + 0.1)
+        s.step()
+    assert s.state is State.PAUSED, "额度用完还是得认输"
+    assert "校验失败" in s.message
+    assert len(mouse.moves) == CLICK_RETRIES + 1, "重按次数不能超额度"
+
+
+def test_画面动过就不重按():
+    """画面只要动过，就不叫「没点上」—— 盲重按可能把棋下歪。"""
+    start = Board.from_fen(START_FEN)
+    other = start.copy()
+    make(other, "b2e2")
+    p = _Provider(start)
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    mouse = _CountingMouse()
+    s.deps.mouse = mouse
+
+    _run_until(s, State.VERIFY)
+    first = len(mouse.moves)
+    p.board = other  # 画面停在别处
+    clock.advance(VERIFY_TIMEOUT_S + 0.1)
+    s.step()
+    assert s.state is State.PAUSED
+    assert len(mouse.moves) == first, "画面动过就不该再点一次"
 
 
 def test_彩排模式校验失败时给出彩排提示():
@@ -937,9 +1008,7 @@ def test_恢复之后不会凭旧账立刻又暂停():
 def test_恢复之后不会因为暂停期间的时间被判终局():
     """`resume()` 也要刷新静止计时：暂停期间没人走棋，旧时间戳会让恢复当场收摊。"""
     clock = _Clock()
-    s = _make_session(
-        State.OPPONENT_TURN, provider=_Provider(_model_board()), clock=clock
-    )
+    s = _make_session(State.OPPONENT_TURN, provider=_Provider(_model_board()), clock=clock)
     clock.advance(1.0)
     s.pause()
     clock.advance(60.0)  # 人看了很久才按 F8
@@ -1004,8 +1073,9 @@ def test_校验失败重试不会把同一手记两遍():
     _run_until(s, State.VERIFY)
     assert rec.moves == [], "还没确认走成就不该记谱"
 
-    clock.advance(VERIFY_TIMEOUT_S + 0.1)  # 画面一直没变 → 超时
-    s.step()
+    for _ in range(CLICK_RETRIES + 1):  # 画面一直没变 → 自动重按，额度用完才暂停
+        clock.advance(VERIFY_TIMEOUT_S + 0.1)
+        s.step()
     assert s.state is State.PAUSED
     assert rec.moves == [], "没走成的一手绝不能进记谱"
 
