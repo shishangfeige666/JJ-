@@ -178,9 +178,22 @@ uv run python tools/calibrate.py --manual  # 鼠标点两个交叉点手工标�
 
 ## 常见问题
 
+**Q：启动就报「未找到标题为「JJ象棋」的窗口」。**
+程序按窗口标题找游戏。请确认：微信电脑版已经打开 JJ象棋小程序（不是只在手机上看）、
+小程序窗口没有最小化。窗口标题必须正好是 `JJ象棋` —— 用
+`uv run python tools/check_capture.py` 可以看到当前所有可见窗口的实际标题。
+如果你的标题不一样（换版本、换渠道），改 `src/jjchess/main.py` 顶部的
+`WINDOW_TITLE` 常量即可。
+
 **Q：脚本看得见棋盘但点不动鼠标 / 抓图全黑。**
 进程完整性级别不是 Medium。见上面「运行前提」，跑一次
 `icacls "<项目目录>" /setintegritylevel Medium`，再用 `tools/check_capture.py` 自检。
+
+**Q：终端说「没找到皮卡鱼引擎 …，退回内置简易引擎（棋力很低）」。**
+`vendor/pikafish/` 下缺文件（引擎二进制不入库）。跑一次
+`uv run python tools/fetch_pikafish.py` 自动下载并校验 sha256。
+注意 **`pikafish.exe` 和 `pikafish.nnue` 必须都在**：NNUE 权重是独立文件，
+少了它引擎起不来。内置的简易引擎只是「没引擎也能跑通流程」的兜底，棋力约等于初学者。
 
 **Q：一直显示「还没看到棋盘（可能停在大厅/菜单），等待对局开始…」。**
 程序在等一个棋盘画面。请手动进到对局里（大厅、战绩页都识别不出棋盘）。

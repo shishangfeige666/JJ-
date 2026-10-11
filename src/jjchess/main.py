@@ -83,7 +83,10 @@ LOOP_SLEEP = 0.02
 #: 真机实测：黑方「卒 6 平 5 吃兵」的过程被逐帧喂进 `interpret`，模型先认成
 #: 「炮 7 进 8」、再认成别的，一步错步步错，最后只能暂停。等画面停下来再上报，
 #: 中间那些过渡帧就自然被丢掉了。
-SETTLE_SEC = 0.30
+#:
+#: 0.30 → 0.50：吃子那一下棋子会闪一下（被吃的子短暂消失又出现），0.30 秒只有
+#: 约 2.5 帧，闪出来的假局面照样判「稳」。实测一轮约 0.12 秒，0.50 秒约 4 帧。
+SETTLE_SEC = 0.50
 #: 每隔这么久回头复查一次「棋盘还在不在」（秒）。
 #:
 #: 棋盘定位成功之后 `geom` 就一直复用，`locate()` 再也不会被调用 —— 那条
@@ -518,12 +521,22 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     last_state: State | None = None
     last_fen: str | None = None
     dumped = False
+    board_lost = False
     settle = FrameSettle()
     last_locate = time.monotonic()
     try:
         while not session.should_stop:
             _handle_hotkeys(hotkeys.poll(), session, mouse)
             if session.should_stop:
+                break
+            if session.state is State.GAME_OVER:
+                # spec 4.x 的终局检测写的是「判定对局结束，停止并打印对局记录」。
+                # 少了这个出口，进程会一直空转打日志、记谱文件永远不落盘。
+                #
+                # 判断放在**循环开头**而不是末尾：循环体里有 `continue`（棋盘定位不到
+                # 时的早退分支），末尾的判断会被它绕过去 —— 真机上就卡在这里空转。
+                # 放在开头，无论从哪条路走到终局，下一轮都会收尾。
+                print(f"对局结束（{session.message}），正在收尾…")
                 break
 
             img = grab_usable(window)
@@ -588,8 +601,15 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     # 结算画面（「再来一局」弹窗）定位不了棋盘，可 `geom` 一直在复用，
                     # 于是拿旧几何去认会得到一盘空棋。那不是局面，是「画面没了」。
                     # 转成 `None` 交给会话，让它走 `BOARD_LOST` → `GAME_OVER` 那条路。
-                    print("[画面] 认不到双方将帅，当作棋盘已消失", file=sys.stderr)
+                    #
+                    # 只在这一段「看不到棋盘」的**头一帧**打一次：结算画面停在那里之后
+                    # 每帧都打，几十秒能刷几百行，把真正有用的日志淹掉。
+                    if not board_lost:
+                        print("[画面] 认不到双方将帅，当作棋盘已消失", file=sys.stderr)
+                        board_lost = True
                     rec = None
+                else:
+                    board_lost = False
             except Exception as exc:  # noqa: BLE001 - 单帧识别失败不该打断整局
                 print(f"识别失败（{exc}），跳过这一帧", file=sys.stderr)
                 latest["board"] = None

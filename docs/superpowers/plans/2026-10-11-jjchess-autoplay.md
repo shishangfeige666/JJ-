@@ -28,7 +28,7 @@
 - **引擎路径**：`vendor/pikafish/pikafish.exe` 与 `vendor/pikafish/pikafish.nnue`（**两个文件都必须存在**）。
 - **引擎默认参数**：`--movetime 1200 --threads 8 --hash 512`。
 - **引擎交互铁律**：发完 `go` **绝不可立即发 `quit`**；必须阻塞读 stdout 直到出现 `bestmove` 行。非法 FEN 会让引擎 **exit code 1 自杀**，wrapper 必须检测并自动重启（≤3 次）。
-- **视觉常量**：`conf_min = 0.75`、`conf_good = 0.90`、empty 剪枝阈值 `0.9`、ROI 边长 `1.30 * cell_px`、模板 `72×72` 灰度+CLAHE、匹配法 `cv2.TM_CCOEFF_NORMED`。
+- **视觉常量**：`conf_min = 0.60`、`conf_good = 0.75`、判空用**拉普拉斯方差** `EMPTY_LAPLACIAN = 3000`（不是 empty 模板相关，见 Task 12 的 Ruling）、ROI 边长 `1.30 * cell_px`、搜索尺度 `1.90`、模板 `72×72` 灰度+CLAHE、匹配窗口 `MATCH_CORE_CELLS = 0.85`（避开选中光圈）、匹配法 `cv2.TM_CCOEFF_NORMED`。
 - **纠错常量**：`TOLERANCE_CELLS = 1`。
 - **拟人化**：`human_delay` 默认 `{enabled: false, min_s: 0.5, max_s: 2.0}`；延迟必须切成 **≤50ms 片段**轮询暂停标志（保证 S6 可中断）。鼠标落点抖动 ±6px，按下→抬起 `60~140ms`，两点间 `180~350ms`。
 - **git 提交信息前缀**：`feat:` / `test:` / `docs:` / `chore:`。
@@ -516,7 +516,7 @@ git -c user.name=dev -c user.email=dev@local commit -m "feat: BoardGeometry 像�
 - Consumes: 无
 - Produces:
   - `@dataclass class Config`，字段：`engine_path: Path`、`nnue_path: Path`、`movetime_ms: int`、`threads: int`、`hash_mb: int`、`conf_min: float`、`conf_good: float`、`tolerance_cells: int`、`human_delay: tuple[float,float] | None`、`gameover_idle_sec: float`、`debug_dir: Path | None`、`record: bool`
-  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.75, conf_good=0.90, tolerance_cells=1, human_delay=None, gameover_idle_sec=12.0, record=True`）
+  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.60, conf_good=0.75, tolerance_cells=1, human_delay=None, gameover_idle_sec=12.0, record=True`）—— 置信度阈值从 0.75/0.90 下调见 Task 15 的 Ruling
   - `load_config(path: Path | None, overrides: dict) -> Config`
   - `parse_human_delay(arg: str | None) -> tuple[float,float] | None`
 
@@ -559,7 +559,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.config'`
 {
   "engine": { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
               "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
-  "vision": { "conf_min": 0.75, "conf_good": 0.90 },
+  "vision": { "conf_min": 0.60, "conf_good": 0.75 },
   "session": { "tolerance_cells": 1, "gameover_idle_sec": 12.0,
                "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
   "record": true
@@ -1076,7 +1076,7 @@ def test_开局32子全对(opening):
     rec = recognize(img, geom, ts, ScreenMapper(RED))
     assert rec.board.grid.tolist() == expect.grid.tolist()
     assert rec.unknown == []
-    assert rec.confidence.min() > 0.75
+    assert rec.confidence.min() > 0.75   # 实测定在 0.872（MATCH_CORE_CELLS = 0.85）
 
 @pytest.mark.parametrize("name", ["mid_01", "mid_02", "mid_03"])
 def test_中局识别正确(name):
@@ -1118,7 +1118,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.vision.reco
 
 - [ ] **Step 3: 实现 `recognize`**
 
-对屏幕 `(row, col)` 遍历 90 格：`make_patch` → `templates.match` → `CHAR_VALUES[名字]`（`.` 映射为 `0`）；`(rank, file) = mapper.to_board(row, col)`，写进 `board.grid[rank, file]`。置信度写 `confidence[row, col]`；`conf < conf_min(0.75)` 的格子**置为 `0`（空）**并加入 `unknown`。返回的 `board.side` 设为 `side_to_move`。
+对屏幕 `(row, col)` 遍历 90 格：`make_patch` → `templates.match` → `CHAR_VALUES[名字]`（`.` 映射为 `0`）；`(rank, file) = mapper.to_board(row, col)`，写进 `board.grid[rank, file]`。置信度写 `confidence[row, col]`；`conf < conf_min(0.60)` 的格子**置为 `0`（空）**并加入 `unknown`。返回的 `board.side` 设为 `side_to_move`。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1391,7 +1391,7 @@ return None
 - `MY_TURN`：若未 `my_side` 判定过，用首帧 `mapper` 判定（`auto` 模式）。
 - `THINKING`：`analyse(board.to_fen(), cfg.movetime_ms)`；记录 `think_ms`；若有 `human_delay`，用 `interruptible_sleep(random.uniform(*human_delay), lambda: self._pause_requested or self.should_stop)`，被中断则回到 `MY_TURN` 且**不走子**。面板 `message` 设为 `f"THINKING (human delay {d:.1f}s)"`。
 - `PLAYING`：`mouse.play_move(mv, geom_screen)`；随后 `recorder.add(...)`。
-- `VERIFY`：重抓一帧（`board_provider()` 返回 `None` 时按失败处理）→ 与 `make(prev, mv)` 比对；一致 → `OPPONENT_TURN`；不一致 → 重试 1 次，仍不一致 → `PAUSED` 并 `message = "点击后局面校验失败，已暂停"`。
+- `VERIFY`：重抓一帧（`board_provider()` 返回 `None` 时按失败处理）→ 与 `make(prev, mv)` 比对，**落点必须精确匹配**（一颗子走完一定在落点上，只放宽其余格子）；一致 → `OPPONENT_TURN`；不一致 → 在 `VERIFY_TIMEOUT_S = 5.0` 秒内继续等（游戏里棋子是滑过去的，吃子动画实测要 2~3 秒才停稳），超时仍不一致 → `PAUSED` 并 `message = "点击后局面校验失败，已暂停"`。
 - `OPPONENT_TURN`：`cur = board_provider()`；`cur is None`（抓图失败/白帧）→ **直接 return，不改动任何状态**（`[RF-2]`）；`interpret(prev, cur)` 得着法 → 采纳并 `recorder.add` → `MY_TURN`。
   连续 3 次 `interpret` 返回 `None` 且 `cur != prev` → `PAUSED` 并 `message = "无法解释局面变化，已暂停（请检查识别）"`。
 - `IDLE`：`board_provider()` 返回的局面与 `START_FEN` 一致（或棋子数 ≥ 28 且双方将帅在位）→ 判定开局，转 `MY_TURN`。
@@ -1467,7 +1467,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.ui'`
 
 - [ ] **Step 3: 实现 `compose` 与 `Panel`**
 
-- 左半：`frame` 缩放到 `(width*0.6, height)`；`geom` 非空时在每个交叉点画识别字符与置信度色框（`>0.9` 绿 / `0.75~0.9` 黄 / `<0.75` 红）；`rec.unknown` 的格子画红叉。
+- 左半：`frame` 缩放到 `(width*0.6, height)`；`geom` 非空时在每个交叉点画识别字符与置信度色框（`>0.75` 绿 / `0.60~0.75` 黄 / `<0.60` 红）；`rec.unknown` 的格子画红叉。
 - 右半：用 `cv2.putText` 逐行输出中文信息（**OpenCV 的 `putText` 不支持中文**，用 `cv2.freetype`？—— 不引入新依赖，改为：中文用 PIL？也不行）。
   **决策**：`cv2.putText` 只画 ASCII。中文信息（执色、状态说明）用 `cv2.putText` 的 ASCII 等价形式输出（如 `SIDE: RED`、`STATE: THINKING`），中文仅出现在**终端日志与导出的记谱文件**里。这样零新依赖，且 panel 的信息在调试场景足够。
 - 底部状态条：`RUNNING / PAUSED / DRY-RUN / GAME OVER` + `session.message`（ASCII 化）。

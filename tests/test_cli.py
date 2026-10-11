@@ -15,9 +15,12 @@ import numpy as np
 import pytest
 
 from jjchess.config import DEFAULT_HUMAN_DELAY, Config, parse_human_delay
-from jjchess.geometry import BLACK, RED, BoardGeometry
+from jjchess.engine.uci import Analysis
+from jjchess.geometry import BLACK, RED, BoardGeometry, ScreenMapper
 from jjchess.main import (
+    EXIT_OK,
     FrameSettle,
+    _play,
     build_parser,
     count_pieces,
     detect_side,
@@ -32,6 +35,7 @@ from jjchess.main import (
 )
 from jjchess.rules.board import START_FEN, Board
 from jjchess.session import State
+from jjchess.vision.recognizer import Recognition
 from jjchess.window import WindowNotFound
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -447,3 +451,156 @@ def test_停稳之后新局面的第一帧仍然不算停稳():
 
 def test_屏幕几何原点为零时与客户区几何等价():
     assert screen_geometry(_FAKE_GEOM, (0, 0)) == _FAKE_GEOM
+
+
+# ============================================================ 主循环收尾
+
+
+class _LoopWindow:
+    """`_play` 主循环要的最小窗口：抓图 + 尺寸 + 客户区原点。"""
+
+    hwnd = 1
+    title = "JJ象棋"
+    client_origin = (0, 0)
+    client_size = (200, 300)
+
+    def grab(self) -> np.ndarray:
+        return _good()
+
+    def refresh(self) -> None:
+        pass
+
+    def size_changed(self, width: int, height: int) -> bool:
+        return False
+
+
+class _NoKeys:
+    """热键桩：一次都不按。"""
+
+    def poll(self) -> dict[str, bool]:
+        return {}
+
+
+class _ResizeWindow(_LoopWindow):
+    """抓够 `after` 帧之后开始报「窗口尺寸变了」。
+
+    真机上把 `geom` 清成 `None` 的是结算弹窗（`locate()` 抛 `BoardNotFound`），
+    这里用 `size_changed` 走同一条清空路径 —— 两者都会把循环逼进那个早退分支。
+    """
+
+    def __init__(self, after: int) -> None:
+        self.after = after
+        self.checks = 0
+
+    def size_changed(self, width: int, height: int) -> bool:
+        self.checks += 1
+        return self.checks > self.after
+
+
+class _StubEngine:
+    """引擎桩：永远给同一步合法着法。主循环测试不关心棋力，只关心它不崩。"""
+
+    def analyse(self, fen: str, movetime_ms: int = 1200) -> Analysis:
+        return Analysis(bestmove="h2e2", score_cp=0, depth=1)
+
+
+def _loop_recognition() -> Recognition:
+    return Recognition(
+        board=Board.from_fen(START_FEN),
+        confidence=np.ones((10, 9), np.float32),
+        unknown=[],
+    )
+
+
+def test_终局后主循环收尾退出(tmp_path, monkeypatch, capsys):
+    """spec 的终局检测写的是「判定对局结束，**停止**并打印对局记录」。
+
+    真机上少了这个 break：对局结束后进程一直空转打日志，`_finish()` 永远不跑，
+    记谱文件永远不落盘。这条测试把「画面还在、但已经认不出棋盘」的结算现场
+    搬进主循环，断言循环会自己收摊返回 `EXIT_OK`。
+
+    没有 break 时循环不会停 —— 所以让 `grab_usable` 在抓够次数之后开始返回 `None`，
+    让它以 `EXIT_NO_FRAME` 收场，测试是失败而不是卡死。
+    """
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+
+    calls = {"recognize": 0, "grab": 0}
+
+    def fake_recognize(*_args, **_kwargs):
+        calls["recognize"] += 1
+        return rec if calls["recognize"] == 1 else None
+
+    def fake_grab(*_args, **_kwargs):
+        calls["grab"] += 1
+        return _good() if calls["grab"] <= 40 else None
+
+    monkeypatch.setattr("jjchess.main.recognize", fake_recognize)
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+    monkeypatch.setattr("jjchess.main.Hotkeys", _NoKeys)
+    monkeypatch.setattr("jjchess.main.LOOP_SLEEP", 0.0)
+    monkeypatch.setattr("jjchess.main.MAX_BAD_STREAK", 3)
+    # 6 秒的棋盘失联额度在这条测试里没有意义，拨到 0 免得白等。
+    monkeypatch.setattr("jjchess.session.BOARD_LOST_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(
+        "jjchess.main._wait_for_board",
+        lambda *_a, **_k: (None, geom, rec, ScreenMapper(RED), None, RED),
+    )
+
+    args = build_parser().parse_args(["--no-panel", "--dry-run", "--debug-dir", str(tmp_path)])
+    cfg = Config(debug_dir=tmp_path)
+
+    assert _play(args, cfg, _LoopWindow(), None) == EXIT_OK
+    assert "对局结束" in capsys.readouterr().out
+
+
+def test_棋盘定位不到时终局也要收尾(tmp_path, monkeypatch, capsys):
+    """收尾判断必须放在循环**开头**，否则会被早退分支绕过去。
+
+    这是真机踩出来的：对局结束时画面切到结算弹窗，`locate()` 连续两次都抛
+    `BoardNotFound`，于是走的是「`geom is None` → 定位不到 → `session.step()` →
+    `continue`」那条早退分支。收尾判断原来写在循环末尾，`continue` 直接跳过它，
+    进程就在那里空转 —— 状态不再变化，终端一行都不打，记谱永远不落盘。
+    放到开头之后，无论从哪条路走到终局，下一轮都会收尾。
+    """
+    from jjchess.vision.locator import BoardNotFound
+
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    calls = {"grab": 0}
+
+    def fake_grab(*_args, **_kwargs):
+        calls["grab"] += 1
+        return _good() if calls["grab"] <= 40 else None
+
+    def boom(_img):
+        raise BoardNotFound("画面里没有棋盘")
+
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.recognize", lambda *_a, **_k: rec)
+    monkeypatch.setattr("jjchess.main.locate", boom)
+    # 关掉定期复查，专测「窗口尺寸变了 → geom 清空 → 定位不到」这条早退路径。
+    monkeypatch.setattr("jjchess.main.RELOCATE_EVERY_S", 1e9)
+    monkeypatch.setattr("jjchess.main.Hotkeys", _NoKeys)
+    monkeypatch.setattr("jjchess.main.LOOP_SLEEP", 0.0)
+    monkeypatch.setattr("jjchess.main.MAX_BAD_STREAK", 3)
+    monkeypatch.setattr("jjchess.session.BOARD_LOST_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(
+        "jjchess.main._wait_for_board",
+        lambda *_a, **_k: (None, geom, rec, ScreenMapper(RED), None, RED),
+    )
+
+    args = build_parser().parse_args(["--no-panel", "--dry-run", "--debug-dir", str(tmp_path)])
+    cfg = Config(debug_dir=tmp_path)
+
+    # 头一帧正常：`latest["board"]` 初值就是开局局面，会话第一轮就会走出 IDLE 落到
+    # 「轮到我方」。之后立刻开始报「尺寸变了」，把循环逼进那条早退分支。
+    #
+    # 这里必须卡在**刚走出 IDLE 那一轮**，不能再往后放：真机上是「对方回合」时棋盘
+    # 消失的，而如果让会话先跑进 `PLAYING`，`geom` 已经没了、点不了鼠标，它会先按
+    # 「走子拿不到几何」自动暂停 —— 那是另一条路，测不到这个缺陷。
+    assert _play(args, cfg, _ResizeWindow(after=1), _StubEngine()) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "对局结束" in out
+

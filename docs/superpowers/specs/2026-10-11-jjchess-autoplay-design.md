@@ -167,12 +167,13 @@ class BoardGeometry:
 
 ### 4.4 `src/jjchess/vision/templates.py` + `recognizer.py` —— 棋子识别
 
-**棋类集合（15 类）**：`K帅/将 A仕/士 E相/象 H马 R车 C炮 P兵/卒` × `{r红, b黑}` + `empty` 空点 = 15。
+**棋类集合（15 类）**：`K帅/将 A仕/士 B相/象 N马 R车 C炮 P兵/卒` × `{r红, b黑}` + `.` 空点 = 15。
+（用 FEN 标准字符 `B`/`N`，`E`/`H` 只作为 `PIECE_CHAR_ALIASES` 里的输入别名保留。）
 
 **模板获取**（`tools/calibrate.py`，一次性）：
 
 1. 让用户把游戏停在**开局标准局面**（或脚本自动检测到开局局面）
-2. 按已知初始布局，在每个交叉点切 ROI，得到 14 类模板（同类多格 → 取像素中位数，抗噪）
+2. 按已知初始布局，在每个交叉点切 ROI，得到 14 类模板（同类多格 → 取**得分最高**的那一格，不是中位数）
 3. 从未被占据的交叉点切 `empty` 模板（取多格中位数——棋盘木纹均匀，交叉点形态一致）
 4. 落盘 `config/templates.npz`（键：类名 → `(72,72,3) uint8`）
 
@@ -186,9 +187,22 @@ ROI 边长 = round(1.30 * cell_px)   # 略大于圆盘，含少量木纹背景
 → argmax
 ```
 
-**两阶段剪枝**：先只和 `empty` 模板比，相关性 > 0.9 ⇒ 直接判空；否则再和 14 类比。既快又避免把空点误判成棋子。
+**判空用拉普拉斯方差，不是空模板相关**（原方案已实测证伪）：
+先算这一格的拉普拉斯方差 `lap`，`lap < EMPTY_LAPLACIAN = 3000` 就判空
+（`conf = 1/(1+(lap/EMPTY_LAPLACIAN)**2)`），否则再和 14 类棋子比。
+实测空点 250~1149、棋子 8809~18627，差 7.7 倍；而「空点 vs 空模板」的相关性本身只有 0.65，
+分数散落在 0.046~0.926，根本分不开。
 
-**置信度与兜底**：`conf < 0.75` 标 `unknown`，置信度矩阵 `(10,9)` 一并返回；面板上按 绿(>0.9)/黄(0.75~0.9)/红(<0.75) 着色标注。
+**匹配窗口要缩到核心**：`MATCH_CORE_CELLS = 0.85`（只取中心 85% 做相关）。
+棋子选中时的**光圈**正好落在 ROI 外圈，全尺寸匹配会被它严重干扰 ——
+真机上量到「黑砲」那格 `top1 = 0.722 / top2 = 0.686`（只差 0.036，随时翻车），
+缩到 0.85 后变成 `0.839 / 0.693`；两个 fixture 的分类正确率都是 1.000。
+（缩到 0.95 差距掉回 0.103，1.05 以上光圈又进得来，所以取 0.85。）
+
+**置信度与兜底**：`conf < 0.60` 标 `unknown`，置信度矩阵 `(10,9)` 一并返回；
+面板上按 绿(>0.75)/黄(0.60~0.75)/红(<0.60) 着色标注。
+阈值从最初的 0.75/0.90 下调，是因为实测棋子 top1 最低 0.798、空点 conf 最低 0.872，
+原阈值会把每一格都标成不可信。
 
 ```python
 @dataclass
@@ -462,14 +476,23 @@ rank = row
 
 ```json
 {
-  "window":  { "title_substr": "JJ象棋", "capture_method": "printwindow" },
-  "board":   { "roi_y_frac": [0.15, 0.80], "edge_thresh": 60 },
-  "vision":  { "roi_scale": 1.30, "template_size": 72, "conf_min": 0.75, "conf_good": 0.90 },
-  "engine":  { "path": "vendor/pikafish/pikafish.exe", "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
-  "control": { "jitter_px": 6, "down_up_ms": [60,140], "between_ms": [180,350], "dry_run": false },
-  "session": { "side": "auto", "tolerance_cells": 1, "stable_frames": 2, "endgame_idle_s": 12 }
+  "engine":  { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
+               "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
+  "vision":  { "conf_min": 0.60, "conf_good": 0.75 },
+  "session": { "tolerance_cells": 1, "gameover_idle_sec": 12.0,
+               "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
+  "record":  true
 }
 ```
+
+没有出现在这里、只作为模块常量的：窗口标题 `WINDOW_TITLE = "JJ象棋"`（`src/jjchess/main.py`）、
+棋盘 ROI 比例 `ROI_TOP/ROI_BOTTOM = 0.15/0.80`、`ROI_LEFT/ROI_RIGHT = 0.01/0.99`、
+识别尺度 `ROI_SCALE = 1.30` / `SEARCH_SCALE = 1.90` / `TEMPLATE_PX = 72` / `MATCH_CORE_CELLS = 0.85` /
+`EMPTY_LAPLACIAN = 3000`（`src/jjchess/vision/templates.py`）、
+走子校验额度 `VERIFY_TIMEOUT_S = 5.0`、棋盘丢失额度 `BOARD_LOST_TIMEOUT_S = 6.0`（`src/jjchess/session.py`）、
+画面稳定闸门 `SETTLE_SEC = 0.50`、定期复查棋盘 `RELOCATE_EVERY_S = 2.0`（`src/jjchess/main.py`）。
+这些没做成配置项，是因为它们要么是「跟游戏画面绑定、换游戏才改」的量，
+要么是调参时反复量过、写死并配了注释与测试比暴露给用户更安全。
 
 `config/calibration.json` 与 `config/templates.npz` 为**运行时生成**，不入库，由 `tools/calibrate.py` 产出。
 
@@ -559,15 +582,16 @@ default = true
 
 | 风险 | 对策 |
 |---|---|
-| Chromium 窗口 `PrintWindow` 偶发返回空白帧 | 全白检测 → 退避重试 → 连续 5 次失败自动切 BitBlt 屏幕法 |
-| 窗口被拖动 / 小程序尺寸变化 | 每帧校验 hwnd 与客户区尺寸；变化则重新定位棋盘 |
-| 棋子选中高亮、走子动画导致误识别 | 只取盘心区 + CLAHE 归一化；动画期等待画面稳定（连续 2 帧一致）才识别 |
-| 单格识别错误导致非法局面 | 合法着法解释器自动纠正；送引擎前 `sanity_check` |
+| Chromium 窗口 `PrintWindow` 偶发返回空白帧 | `is_blank_frame` + `is_torn_frame` 双检（撕裂帧的暗像素比达 0.2993），坏帧跳过重抓 `GRAB_ATTEMPTS = 3` 次；仍失败计入 `bad_streak`，连续 `MAX_BAD_STREAK = 10` 次退出 |
+| 窗口被拖动 / 小程序尺寸变化 | 每帧校验 hwnd 与客户区尺寸；变化则重新定位棋盘。另加每 `RELOCATE_EVERY_S = 2.0` 秒定期复查（`locate()` 实测 10.9~12.7 ms，代价可忽略），定位失败就当作棋盘已消失 |
+| 棋子选中高亮、走子动画导致误识别 | 只取盘心区 + CLAHE 归一化；动画期等画面稳定（`FrameSettle`，同一 FEN 连续 `SETTLE_SEC = 0.50` 秒）才识别 |
+| 单格识别错误导致非法局面 | 合法着法解释器自动纠正；送引擎前 `sanity_check`。`interpret()` 额外要求**落点精确匹配** —— 一颗子走完一定在落点上，只放宽其余格子，否则容忍度会变成模型漂移的通道（真机踩过） |
 | 皮卡鱼严格校验导致进程自杀 | 先校验后发送；wrapper 检测进程退出并自动重启（最多 3 次）。**已实测确认**：非法 FEN → exit code 1 |
 | 引擎缺少 NNUE 权重无法加载 | `pikafish.nnue`（50.7 MB）与 exe 必须同目录；`fetch_pikafish.py` 安装**两个**文件；自检用 `go depth 10` 确认能出 `bestmove` |
 | UCI 读取时序错误导致只搜到 depth 1 | **发完 `go` 不可立即 `quit`**；必须阻塞读到 `bestmove` 行 |
 | 皮卡鱼下载失败（GitHub 403 / 直连仅 25 KB/s 需 35 分钟） | 优先镜像 `gh-proxy.com`（实测 21.6 MB/s，3 秒完成）；`curl --retry 5 -C -` 断点续传；**sha256 强校验**保证镜像内容与官方一致；失败时降级到浅层 α-β 并在面板标红 |
-| 点击落空 / 被弹窗拦截 | 点击后局面复检；重试 1 次；仍失败熔断为 PAUSED |
+| 点击落空 / 走子动画没放完 | 点击后按**时间**给额度复检（`VERIFY_TIMEOUT_S = 5.0` 秒），不是「重试 1 次」—— 主循环一轮才 20 ms，两次校验只隔 40 ms，连棋子滑过去的动画都没放完。吃子动画实测要 2~3 秒才停稳；仍对不上就熔断为 PAUSED |
+| 对局结束后进程空转、记谱不落盘 | 终局判断放在**主循环开头**（循环体里有 `continue` 的早退分支，放末尾会被绕过去）；`GAME_OVER` 即 `break` 并走 `_finish()` 落盘记谱 |
 | 鼠标被抢占 / 误操作 | `F8` 即时暂停；`--dry-run` 全程不点击 |
 | 窗口顶部 279px 在屏外 | 抓图不受影响（`PW_RENDERFULLCONTENT` 已实测可拿到屏外部分）；启动时校验棋盘是否完全在屏幕内，否则提示移动窗口 |
 

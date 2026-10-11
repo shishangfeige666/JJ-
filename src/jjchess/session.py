@@ -40,7 +40,7 @@ import numpy as np
 
 from jjchess.config import Config
 from jjchess.geometry import RED, BoardGeometry, ScreenMapper
-from jjchess.rules.moves import legal_moves, make
+from jjchess.rules.moves import legal_moves, make, parse_move
 
 if TYPE_CHECKING:  # pragma: no cover - 只为类型标注
     from jjchess.control import Mouse
@@ -126,12 +126,22 @@ def interpret(prev: Board, cur: Board, tolerance: int = 1) -> str | None:
     **纯函数，不改动入参。** 只在 `legal_moves(prev)` 里搜，所以返回值一定是合法着法 ——
     这正是 spec 说的"拒绝把非法局面喂给皮卡鱼"。允许 `tolerance` 个格子对不上，
     用来吸收「某个子被识别成空格」这类零星错误。
+
+    **但落点必须对得上。** 一颗子走完就一定在落点上，落点是空的只可能说明「这一步
+    还没走成」（抓早了）或者「真着法其实是吃子，还差一格没显出来」。少了这条规矩，
+    容忍度就成了模型漂移的通道 —— 真机上黑炮 d9 吃仕 d0，抓到的帧正好在吃子动画
+    中途（d9 空了、d0 还没显出来），`tolerance = 1` 会让「炮 d9 进 d8」以「d8 也空着、
+    只差一格」为由匹配上，模型从此凭空多一颗 d8 的黑炮，几步之后误报
+    「点击后局面校验失败」。
     """
     if _grid_diff(prev, cur) == 0:
         return None
     for mv in legal_moves(prev):
         trial = prev.copy()
         make(trial, mv)
+        dst_rank, dst_file = parse_move(mv)[1]
+        if trial.grid[dst_rank, dst_file] != cur.grid[dst_rank, dst_file]:
+            continue
         if _grid_diff(trial, cur) <= tolerance:
             return mv
     return None
@@ -168,6 +178,8 @@ class Session:
     _state_before_pause: State = State.MY_TURN
     _idle_since: float = 0.0
     _unexplained: int = 0
+    #: 上一个「记过账」的看不懂局面。同一个局面只算一次 —— 见 `_step_opponent_turn`。
+    _last_unexplained: str | None = None
     _play_at: float = 0.0
     _board_lost_since: float | None = None
     _pending_move: str | None = None
@@ -274,7 +286,7 @@ class Session:
         self.board = board
         self._idle_since = self.deps.now()
         self._unexplained = 0
-        self._verify_tries = 0
+        self._last_unexplained = None
         self.message = "检测到开局局面"
         self.state = State.MY_TURN if self.my_side == RED else State.OPPONENT_TURN
 
@@ -318,6 +330,7 @@ class Session:
             self._auto_pause(State.MY_TURN, f"引擎给出的着法 {mv} 在当前局面下不合法，已暂停")
             return
         self._unexplained = 0
+        self._last_unexplained = None
 
         delays = self.deps.config.human_delay
         if delays:
@@ -359,6 +372,9 @@ class Session:
         2. 画面等于「我方走完**且对方已还着**」→ 两步一起收（对方想得太快时会发生）；
         3. 都没等到、且已经超时 → 认为这一步没生效，回到 `MY_TURN` 重新决策。
 
+        第 1 条也要求**落点上有我方的子**：棋子飞在半路上时落点还是空的，那不叫「走成了」。
+        少了这条，一次没生效的点击会被当成走子成功，后面整盘棋都跟着错位。
+
         抓图失败（`None`）时**什么都不改**，继续等 —— 坏帧不是「局面没变」。
         但一直读不到棋盘（对局已经结束、画面切到结算）就得收摊，见 `BOARD_LOST_TIMEOUT_S`。
         """
@@ -369,6 +385,7 @@ class Session:
             return
         expected = before.copy()
         make(expected, mv)
+        dst_rank, dst_file = parse_move(mv)[1]
 
         cur = self.deps.board_provider()
         if self._note_board(cur):
@@ -377,7 +394,8 @@ class Session:
             return
 
         tol = self.deps.config.tolerance_cells
-        if _grid_diff(cur, expected) <= tol:
+        landed = expected.grid[dst_rank, dst_file] == cur.grid[dst_rank, dst_file]
+        if landed and _grid_diff(cur, expected) <= tol:
             # 允许 `tolerance_cells` 格对不上：吃子那一瞬间抓到的帧可能正好少一格，
             # 为它把整步判失败太亏。对方真还了一着至少动 2 格（起点 + 终点），
             # 所以 `tol = 1` 不会把「对方已经还着」误判成「我方走成了」。
@@ -423,11 +441,21 @@ class Session:
             # [RF-2] 抓图失败：**什么都不改**。绝不能把「没抓到」当成「棋盘空了」。
             return
         if self.board is not None and _grid_diff(cur, self.board) == 0:
+            # 画面回到预期，说明刚才那个看不懂的局面是**瞬时的**（吃子动画把某一格
+            # 闪没了、过渡帧抓早了一拍），不能攒着下次一起算账。
+            self._unexplained = 0
+            self._last_unexplained = None
             return
 
         mv = interpret(self.board, cur, self.deps.config.tolerance_cells)  # type: ignore[arg-type]
         if mv is None:
-            self._unexplained += 1
+            # 一个坏局面只记一次账。`board_provider()` 在新局面停稳之前会一直返回
+            # **同一个**已停稳的盘子，主循环一轮 0.1~0.2 秒，照着数次数的话一个坏帧
+            # 会被连数三次，`MAX_UNEXPLAINED = 3` 立刻误触发暂停（真机实测踩过）。
+            fen = cur.to_fen()
+            if fen != self._last_unexplained:
+                self._last_unexplained = fen
+                self._unexplained += 1
             self.message = f"看不懂局面变化（第 {self._unexplained} 次）"
             if self._unexplained >= MAX_UNEXPLAINED:
                 self._auto_pause(State.OPPONENT_TURN, "无法解释局面变化，已暂停（请检查识别）")
@@ -450,6 +478,7 @@ class Session:
         self.board = delta
         self._idle_since = self.deps.now()
         self._unexplained = 0
+        self._last_unexplained = None
         self.message = f"对方走 {mv}" if opponent else f"走 {mv}"
         self.state = State.MY_TURN
 

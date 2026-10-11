@@ -311,6 +311,35 @@ def test_走子后局面校验通过则轮到对方():
     assert s.board is not None and s.board.grid.tolist() == expected.grid.tolist()
 
 
+def test_棋子还在半路上时不算走成了():
+    """落点还是空的（棋子正飞过去）只能说明「还没走成」，不能拿容忍度把它认成走成了。
+
+    真机踩过：点完鼠标后抓到的帧正好在棋子滑行途中，落点是空的，
+    `_grid_diff` 只差 1 格就被 `tolerance_cells = 1` 放行，于是把一次
+    **还没生效**的点击记成走子成功，整盘棋从此错位。
+    """
+    start = Board.from_fen(START_FEN)
+    expected = start.copy()
+    make(expected, "h2e2")
+    flying = expected.copy()
+    flying.grid[2, 4] = 0  # 红炮已经离开 h2，但还没落到 e2
+
+    p = _Provider(start)
+    clock = _Clock()
+    s = _make_session(State.MY_TURN, provider=p, clock=clock)
+    s.deps.mouse.dry_run = False
+
+    _run_until(s, State.VERIFY)
+    p.board = flying
+    s.step()
+    assert s.state is State.VERIFY, "棋子还在半路上，不能算走成了"
+
+    p.board = expected  # 落定了
+    s.step()
+    assert s.state is State.OPPONENT_TURN
+    assert s.board is not None and s.board.grid.tolist() == expected.grid.tolist()
+
+
 def test_走子后局面校验失败会暂停():
     start = Board.from_fen(START_FEN)
     other = start.copy()
@@ -453,14 +482,56 @@ def test_几何缺失自动暂停后恢复重试同一步():
     assert s.deps.mouse.clicks  # 两次点击（起子 + 落子）
 
 
+def _junk_board(drop: int) -> Board:
+    """红方底线凭空少了 `drop + 1` 个子的局面 —— 没有任何黑方着法能走成这样。
+
+    注意 `Board.grid` 的 `rank 0` 是**红方底线**：FEN 的 rank 0（黑方底线）落在 `grid[9]`。
+    """
+    board = Board.from_fen(START_FEN)
+    board.side = -RED
+    for col in range(drop + 1):
+        board.grid[0, col] = 0
+    return board
+
+
+def _model_board() -> Board:
+    """会话里那盘「模型认为正确」的局面（黑方走）。"""
+    board = Board.from_fen(START_FEN)
+    board.side = -RED
+    return board
+
+
+def test_同一个看不懂的局面看很多次也只算一次():
+    """真机回归：主循环 0.1~0.2 秒一轮，`board_provider()` 在新局面停稳之前会一直返回
+    **同一个**已停稳的盘子。照着调用次数数的话，一个瞬时坏帧（吃子动画把某一格闪没了）
+    会被连数三次，`MAX_UNEXPLAINED = 3` 当场误触发暂停。"""
+    s = _make_session(State.OPPONENT_TURN, provider=_Provider(_junk_board(1)))
+    for _ in range(20):
+        s.step()
+    assert s.state is State.OPPONENT_TURN
+    assert s.message == "看不懂局面变化（第 1 次）"
+
+
+def test_画面回到预期后看不懂的计数清零():
+    """坏一帧、好一帧、再坏一帧…… 攒不到三次。攒着算的话，一局棋里的零星抖动
+    迟早会把对局误暂停。"""
+    provider = _Provider(_junk_board(1))
+    s = _make_session(State.OPPONENT_TURN, provider=provider)
+    for _ in range(5):
+        provider.board = _junk_board(2)
+        s.step()
+        provider.board = _model_board()
+        s.step()
+    assert s.state is State.OPPONENT_TURN
+    assert not s.message.startswith("无法解释")
+
+
 def test_对方回合看不懂变化后恢复仍停在对方回合():
     """自动暂停必须记住该回到哪一格；旧实现会退回默认的 MY_TURN。"""
-    weird = Board.from_fen(START_FEN)
-    weird.set(6, 0, 0)  # 凭空少两个红兵：没有任何黑方着法能走成这样
-    weird.set(6, 2, 0)
-    weird.side = -RED
-    s = _make_session(State.OPPONENT_TURN, provider=_Provider(weird))
-    for _ in range(5):
+    provider = _Provider(_junk_board(1))
+    s = _make_session(State.OPPONENT_TURN, provider=provider)
+    for i in range(3):
+        provider.board = _junk_board(i + 1)
         s.step()
     assert s.state is State.PAUSED
     assert "看不懂" in s.message or "无法解释" in s.message
@@ -491,14 +562,28 @@ def test_对方走子带一格误识别仍被纠正():
     assert s.board.grid.tolist() == want.grid.tolist()  # 采纳的是修正后的局面
 
 
+def test_落点认不出来时宁可不解释也不能瞎猜():
+    """真机踩过的坑：黑炮 d9 吃仕 d0（我方俥 d7 正好当炮架），抓到的帧恰好在吃子动画中途 ——
+    d9 空了、d0 还没显出来。老实现拿容忍度 1 去配「炮 d9 进 d8」（d8 也空着，只差一格），
+    于是把模型改成「d8 有颗黑炮」，从此和画面对不上，几步之后误报「点击后局面校验失败」。
+
+    一颗子走完一定**在落点上**，所以落点对不上的候选着法一律不认。
+    """
+    prev = Board.from_fen("3ck4/9/3R5/9/9/4P4/9/9/9/3AK4 b - - 0 1")
+    flying = prev.copy()
+    flying.grid[9, 3] = 0  # 黑炮离开 d9，还没落到 d0
+    assert interpret(prev, flying, 1) is None
+
+    landed = prev.copy()
+    make(landed, "d9d0")
+    assert interpret(prev, landed, 1) == "d9d0"
+
+
 def test_无法解释的变化三次后暂停():
-    junk = Board.from_fen(START_FEN)
-    junk.grid[0, 0] = 0
-    junk.grid[0, 1] = 0
-    junk.grid[0, 2] = 0
-    junk.grid[0, 3] = 0
-    s = _make_session(State.OPPONENT_TURN, provider=_Provider(junk))
-    for _ in range(3):
+    provider = _Provider(_junk_board(1))
+    s = _make_session(State.OPPONENT_TURN, provider=provider)
+    for i in range(3):
+        provider.board = _junk_board(i + 1)
         s.step()
     assert s.state is State.PAUSED
     assert "无法解释" in s.message
