@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# 运行时生成物（由 tools/calibrate.py 产出）
+config/calibration.json
+config/templates.npz
+# 引擎二进制（由 tools/fetch_pikafish.py 下载）
+vendor/
+# 调试截图
+debug/
