@@ -793,6 +793,8 @@ def test_认出结算画面后点再来一局并等新棋盘(tmp_path, monkeypat
 
     monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
     monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
+    # 桩帧只有 300x200，真几何的 ROI 会探到画面外，数子那步在这里没有意义。
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 16)
 
     got = _next_round(_LoopWindow(), _NoKeys(), mouse)
     assert got is geom
@@ -826,10 +828,85 @@ def test_空的装饰棋盘不算找到棋盘(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
     monkeypatch.setattr("jjchess.main.locate", lambda _img: geom)
     monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 0)
-    monkeypatch.setattr("jjchess.main.NEW_BOARD_WAIT_S", 0.0)
+    # 别设成 0.0：那样等待循环一次都不进，断言 `is None` 会「因为没跑」而通过，
+    # 等于什么都没验证。
+    monkeypatch.setattr("jjchess.main.NEW_BOARD_WAIT_S", 0.05)
 
     assert _next_round(_LoopWindow(), _NoKeys(), mouse) is None
     assert "等不到棋盘" in capsys.readouterr().err
+
+
+def test_结算画面那块缩小的棋盘不算新棋盘(tmp_path, monkeypatch, capsys):
+    """刚点完「再来一局」的一瞬间画面还没切走，抓到的还是结算画面那块**缩小过的**棋盘。
+
+    真机 run17 实测：点完 137ms 后 `locate()` 给出 `origin=(242.2, 380.5) dx=120.9`，
+    而真棋盘是 `origin=(101.5, 609.3) dx=154.6`。那块棋盘上摆着**终局局面**，
+    子数一点不少，「盘上有没有子」这道闸门拦不住它 —— 得请上一局的几何来比对。
+    """
+    real = BoardGeometry(
+        origin=(101.5226909377448, 609.3224337822102),
+        dx=154.5733818770347,
+        dy=148.05897625343948,
+        cell_px=125.85012981542356,
+    )
+    shrunk = BoardGeometry(
+        origin=(242.19580229755525, 380.46608628399184),
+        dx=120.90468366126439,
+        dy=120.77180305038658,
+        cell_px=102.6560325928286,
+    )
+    result = cv2.imdecode(np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR)
+    mouse = _StubMouse()
+    frames = {"n": 0}
+
+    def fake_grab(*_a, **_k):
+        frames["n"] += 1
+        # 第一帧是结算画面（等按钮用），之后画面切成「新一局」—— 但抓到的几何还是那块缩小的。
+        return result if frames["n"] <= 1 else _good()
+
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: shrunk)
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 30)
+    # 0.05 而不是 0.0：等待循环必须真跑一轮，否则 `is None` 是「因为没跑」通过。
+    monkeypatch.setattr("jjchess.main.NEW_BOARD_WAIT_S", 0.05)
+
+    assert _next_round(_LoopWindow(), _NoKeys(), mouse, real) is None
+    assert "等不到棋盘" in capsys.readouterr().err
+
+
+def test_新棋盘偏几像素也算同一个棋盘(tmp_path, monkeypatch, capsys):
+    """换局那一下拟出来的几何会**偏几像素**，别把它当成「换了个棋盘」而拒掉。
+
+    真机实测：第 2 局的棋盘是 `origin=(101.5866, 602.8613) dx=154.5623`，
+    一局之前是 `origin=(101.5227, 609.3224) dx=154.5734` —— 纵向差 6.5 像素，
+    这就是正常抖动，得放行。
+    """
+    prev = BoardGeometry(
+        origin=(101.5226909377448, 609.3224337822102),
+        dx=154.5733818770347,
+        dy=148.05897625343948,
+        cell_px=125.85012981542356,
+    )
+    fresh = BoardGeometry(
+        origin=(101.58663428488273, 602.8613324256031),
+        dx=154.5623377803936,
+        dy=148.01558198051498,
+        cell_px=125.81324468343773,
+    )
+    result = cv2.imdecode(np.fromfile(FIXTURES / "result.png", np.uint8), cv2.IMREAD_COLOR)
+    mouse = _StubMouse()
+    frames = {"n": 0}
+
+    def fake_grab(*_a, **_k):
+        frames["n"] += 1
+        return result if frames["n"] <= 1 else _good()
+
+    monkeypatch.setattr("jjchess.main.grab_usable", fake_grab)
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: fresh)
+    # 桩帧只有 300x200，真几何的 ROI 会探到画面外，数子那步在这里没有意义。
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 16)
+
+    assert _next_round(_LoopWindow(), _NoKeys(), mouse, prev) is fresh
 
 
 def test_主循环里空棋盘也不认(tmp_path, monkeypatch, capsys):

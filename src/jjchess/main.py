@@ -644,7 +644,35 @@ def is_result_screen(img) -> bool:
     return green >= RESULT_GREEN_MIN and green - blue >= RESULT_GREEN_GAP
 
 
-def _next_round(window, hotkeys: Hotkeys, mouse: Mouse):
+def _new_board_geom(frame: np.ndarray, prev_geom: BoardGeometry | None) -> BoardGeometry | None:
+    """这一帧是不是「真棋盘」？是就返回它的几何，不是就返回 `None`。
+
+    三道闸门，每一道都是真机咬过之后补的：
+
+    1. 结算画面本身不能算棋盘 —— 练习局的结算画面把**终局局面**留在屏幕上，
+       定位得到、双方将帅也都认得出，看起来就是一盘下到一半的棋。上一局刚赢
+       就被它骗了一次「点击后局面校验失败」。
+    2. 「正在匹配」那类页面上有一块**空的**装饰棋盘，`locate()` 照样拟得出网格
+       （真机实测格距 102.7，真棋盘 125.8）。→ 数一数盘上有没有子。
+    3. 结算画面上那块棋盘是**缩小过的**，而且摆着终局局面 —— 子数一点不少，
+       刚点完「再来一局」的一瞬间画面还没切走，光数子拦不住（真机 run17 实测：
+       点完 137ms 后抓到 `origin=(242.2, 380.5) dx=120.9`，真棋盘是
+       `(101.5, 609.3) dx=154.6`）。→ 新棋盘得和上一局「差不多在同一个地方」。
+    """
+    if is_result_screen(frame):
+        return None
+    try:
+        geom = locate(frame)
+    except BoardNotFound:
+        return None
+    if count_pieces(frame, geom) < MIN_PIECES_ON_BOARD:
+        return None
+    if prev_geom is not None and not geom_close(geom, prev_geom):
+        return None
+    return geom
+
+
+def _next_round(window, hotkeys: Hotkeys, mouse: Mouse, prev_geom: BoardGeometry | None = None):
     """一局结束后开下一局：等结算画面 → 点「再来一局」→ 等新棋盘出现。
 
     成功返回新一局的 `BoardGeometry`；用户按了 ESC、或者等不到该等的东西，返回 `None`
@@ -686,17 +714,10 @@ def _next_round(window, hotkeys: Hotkeys, mouse: Mouse):
             return None
         frame = grab_usable(window)
         if frame is not None:
-            try:
-                geom = locate(frame)
-            except BoardNotFound:
-                pass
-            else:
-                # 切到对局之前游戏会先过一屏「正在匹配」，那上面有一块**空的**装饰
-                # 棋盘，`locate()` 照样拟得出网格（真机实测格距 102.7 vs 真棋盘 125.8）。
-                # 认下来的话，第二局会一直卡在 IDLE 里等一个永远等不到的开局。
-                if count_pieces(frame, geom) >= MIN_PIECES_ON_BOARD:
-                    print(f"新一局棋盘定位：{geom}")
-                    return geom
+            geom = _new_board_geom(frame, prev_geom)
+            if geom is not None:
+                print(f"新一局棋盘定位：{geom}")
+                return geom
         time.sleep(0.3)
     print("点了「再来一局」却等不到棋盘，不再自动开新局。", file=sys.stderr)
     return None
@@ -717,6 +738,9 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     if ready is None:
         return EXIT_OK
     _first_img, geom, rec, mapper, templates, my_side = ready
+    # 最近一次**确认过是对的**棋盘几何。`geom` 会在棋盘消失时被清掉，换局那一下
+    # 正需要它 —— 见 `_new_board_geom` 的第 3 道闸门。
+    last_geom = geom
 
     mouse = Mouse(dry_run=args.dry_run, my_side=my_side)
     if args.dry_run:
@@ -783,9 +807,10 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 if args.rounds and finished >= args.rounds:
                     print(f"已下满 {finished} 局（--rounds {args.rounds}），收工。")
                     break
-                geom = _next_round(window, hotkeys, mouse)
+                geom = _next_round(window, hotkeys, mouse, last_geom)
                 if geom is None:
                     break
+                last_geom = geom
                 # 开下一局：会话、记谱、逐帧状态全部重置。
                 latest["board"] = None
                 settle.reset()
@@ -882,6 +907,7 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     time.sleep(0.5)
                     continue
                 geom = found
+                last_geom = found
                 last_locate = time.monotonic()
                 print(f"棋盘重新定位：{geom}")
 
