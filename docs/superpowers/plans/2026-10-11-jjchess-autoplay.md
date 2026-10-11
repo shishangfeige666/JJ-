@@ -1574,6 +1574,20 @@ uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 5
 > 时等待循环一次都不进，`assert ... is None` 是「因为没跑」通过的，那条闸门从没被真正验证过。
 > **注意别改成「每次复查就换几何」**：`locate()` 自己每次抖 ±1.5 像素，那样等于让采样
 > 窗口一直晃，真机实测跑一分钟就撞上「点击后局面校验失败」。
+>
+> **第三次真机反馈（用户报告）：「连续不同棋局我方可能执黑也可能执红」。**
+> 执色原先只在启动时判一次（`_wait_for_board`），而它绑着三处 —— `ScreenMapper`
+> （识别时的屏幕格 ↔ 板坐标映射）、`Mouse.play_move` 的坐标换算、`GameRecorder`
+> 的「我方执色」。第二局换了边而不重判，整块棋盘会被认反 180°、点出去的坐标镜像，
+> 表现就是「替对手走棋」或一直「点击后局面校验失败」。对策：
+> `_adopt_side(args, window, geom, my_side)` 在每次 `_next_round()` 之后、`new_round()`
+> 之前重判一次，变了就一起换 `mapper` / `mouse.my_side` / `my_side`（recorder 本来就
+> 每局重建）。判据从 `detect_side` 里拆出的 `_bottom_row_ink()`，并且要求最下一行
+> **至少 `SIDE_MIN_INK_CELLS = 3` 格看得出字迹**才敢下结论 —— 刚点完「再来一局」
+> 的头几帧棋盘上什么都没有，`detect_side` 的「一片空白 → 默认红」会骗人；等不到
+> （`SIDE_REDETECT_WAIT_S = 6.0` 秒）就沿用上一局的执色。`--side red/black` 钉死不重判。
+> 测试桩 `_patch_round_loop` 里要顺手把 `_adopt_side` 也挡掉，否则每条多轮测试都得
+> 白等 6 秒（桩帧是随机噪声，数不出字迹）。
 
 - [ ] **Step 4: 实现主循环**
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+from typing import ClassVar
 
 import cv2
 import numpy as np
@@ -615,10 +616,14 @@ def test_棋盘定位不到时终局也要收尾(tmp_path, monkeypatch, capsys):
 class _StubMouse:
     """鼠标桩：记录点了哪里，绝不真的动系统光标。"""
 
+    #: 建过的所有桩，用来检查换局之后执色有没有跟着换。
+    made: ClassVar[list[_StubMouse]] = []
+
     def __init__(self, dry_run: bool = False, my_side: int = RED) -> None:
         self.dry_run = dry_run
         self.my_side = my_side
         self.clicks: list[tuple[int, int]] = []
+        _StubMouse.made.append(self)
 
     def click_client(self, x: int, y: int, origin) -> None:
         self.clicks.append((x, y))
@@ -696,6 +701,9 @@ def _patch_round_loop(monkeypatch, geom, rec, tmp_path, extra: list[str]):
         lambda *_a, **_k: (None, geom, rec, ScreenMapper(RED), None, RED),
     )
     monkeypatch.setattr("jjchess.main.Mouse", _StubMouse)
+    # 换局重判执色要抓图等棋子画出来（最多 6 秒），桩帧上看不出字迹，
+    # 不挡掉的话每条多轮测试都得白等 6 秒。
+    monkeypatch.setattr("jjchess.main._adopt_side", lambda _a, _w, _g, side: side)
     args = build_parser().parse_args(["--no-panel", "--debug-dir", str(tmp_path), *extra])
     return args, ctl, starts
 
@@ -754,6 +762,92 @@ def test_再来一局后第二局用新的会话与记谱(tmp_path, monkeypatch,
     assert "第 2 局开始" in out
     assert "已下满 2 局" in out
     assert out.count("，正在收尾…") == 2, "两局都要各自收一次尾"
+
+
+class _SideWindow:
+    """按帧脚本吐画面的窗口桩：最后一帧会一直重复。"""
+
+    hwnd = 1
+    title = "JJ象棋"
+    client_origin = (0, 0)
+    client_size = (900, 1000)
+
+    def __init__(self, frames: list[np.ndarray]) -> None:
+        self.frames = list(frames)
+        self.grabs = 0
+
+    def grab(self) -> np.ndarray:
+        self.grabs += 1
+        if len(self.frames) > 1:
+            return self.frames.pop(0)
+        return self.frames[0]
+
+
+def test_换局之后重新判定执色(capsys):
+    """小程序每一局都可能换边 —— 上一局执红、这一局让执黑，必须重判。
+
+    头两帧是「棋子还没画出来」（刚点完「再来一局」就是这样），这时数不出字迹；
+    等棋子画出来才判得出执黑。**不能**吃 `detect_side` 那个「一片空白 → 默认红」
+    的默认值，否则第二局会认反棋盘、替对手走棋。
+    """
+    from jjchess.main import _adopt_side
+
+    empty = np.full((1000, 900, 3), (120, 170, 215), np.uint8)
+    window = _SideWindow([empty, empty, _synthetic_bottom_row((30, 30, 30))])
+    args = build_parser().parse_args(["--no-panel"])
+
+    assert _adopt_side(args, window, _FAKE_GEOM, RED) == BLACK
+    assert window.grabs >= 3, "前两帧看不出字迹，得接着等"
+    assert "执黑" in capsys.readouterr().out
+
+
+def test_判不出执色就沿用上一局(monkeypatch, capsys):
+    """一片空白时宁可沿用，也不要凭默认值猜一个。"""
+    from jjchess.main import _adopt_side
+
+    monkeypatch.setattr("jjchess.main.SIDE_REDETECT_WAIT_S", 0.0)
+    empty = np.full((1000, 900, 3), (120, 170, 215), np.uint8)
+    args = build_parser().parse_args(["--no-panel"])
+
+    assert _adopt_side(args, _SideWindow([empty]), _FAKE_GEOM, BLACK) == BLACK
+    assert "沿用上一局" in capsys.readouterr().err
+
+
+def test_指定执色时换局也不重判():
+    """`--side red/black` 是用户钉死的，别去跟画面较劲。"""
+    from jjchess.main import _adopt_side
+
+    window = _SideWindow([_synthetic_bottom_row((30, 30, 30))])
+    args = build_parser().parse_args(["--no-panel", "--side", "red"])
+
+    assert _adopt_side(args, window, _FAKE_GEOM, RED) == RED
+    assert window.grabs == 0, "执色钉死了就不该再去抓图"
+
+
+def test_换局换边会把执色一起换过来(tmp_path, monkeypatch, capsys):
+    """第二局执黑时，鼠标和会话的执色都得跟着翻 —— 少翻一个就会替对手走棋。"""
+    geom = _FAKE_GEOM
+    rec = _loop_recognition()
+    args, ctl, _starts = _patch_round_loop(monkeypatch, geom, rec, tmp_path, ["--rounds", "2"])
+    seen: list[int] = []
+    _StubMouse.made.clear()
+
+    def fake_next_round(*_a, **_k):
+        ctl["give"] = 1
+        return geom
+
+    def fake_adopt_side(_args, _win, _geom, side):
+        seen.append(side)
+        return BLACK
+
+    monkeypatch.setattr("jjchess.main._next_round", fake_next_round)
+    monkeypatch.setattr("jjchess.main._adopt_side", fake_adopt_side)
+
+    assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_OK
+    out = capsys.readouterr().out
+    assert seen == [RED], "换局时要拿上一局的执色进去重判"
+    assert _StubMouse.made[0].my_side == BLACK, "鼠标没跟着换边"
+    assert "第 2 局开始（我方执黑）" in out
 
 
 def test_等不到结算画面就收工(tmp_path, monkeypatch, capsys):

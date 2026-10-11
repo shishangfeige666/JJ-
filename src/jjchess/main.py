@@ -126,6 +126,10 @@ NEW_BOARD_WAIT_S = 20.0
 #: 认出来的棋盘上至少要有这么多子才算「真棋盘」。
 #: `locate()` 会被空的装饰棋盘骗到（见主循环里那段注释），所以定位成功之后还得数一数。
 MIN_PIECES_ON_BOARD = 2
+#: 换局之后重新判定执色时，最多等这么久让棋子画出来（秒）。
+SIDE_REDETECT_WAIT_S = 6.0
+#: 最下面那一排至少要有这么多格看得出字迹，才敢拿它判执色。
+SIDE_MIN_INK_CELLS = 3
 
 #: 复查时「新拟合的几何还算同一个棋盘」的容差（原点像素 / 格距像素）。
 #
@@ -231,12 +235,12 @@ def _cell_center(img: np.ndarray, geom: BoardGeometry, row: int, col: int) -> np
     return img[y0:y1, x0:x1]
 
 
-def detect_side(img: np.ndarray, geom: BoardGeometry) -> int:
-    """判断我方执红还是执黑 —— 看屏幕**最下面那一排**棋子的字是红还是黑。
+def _bottom_row_ink(img: np.ndarray, geom: BoardGeometry) -> tuple[int, int]:
+    """数一数最下面那一排：几格有字迹，其中几格偏红。
 
-    依据：这类对局界面总是把「我方」画在自己这一侧（下方），红方棋子用红字、
-    黑方用黑字。取的是格子中心的笔画像素，用 `R - B` 区分 —— 木色棋盘本身
-    R 也大于 B，所以必须先靠「比周围暗」把笔画挑出来再判色。
+    从 `detect_side` 里拆出来，是为了把「看不清」和「看清了是黑」分开 ——
+    刚点完「再来一局」的头几帧棋盘上还什么都没有，那时有字迹的格子数是 0，
+    `detect_side` 会给出默认值（红），换局重判执色时不能吃这个默认值。
     """
     reddish = 0
     inked = 0
@@ -252,9 +256,48 @@ def detect_side(img: np.ndarray, geom: BoardGeometry) -> int:
         inked += 1
         if float(mean_bgr[2]) - float(mean_bgr[0]) > _RED_SIDE_MARGIN:
             reddish += 1
+    return inked, reddish
+
+
+def detect_side(img: np.ndarray, geom: BoardGeometry) -> int:
+    """判断我方执红还是执黑 —— 看屏幕**最下面那一排**棋子的字是红还是黑。
+
+    依据：这类对局界面总是把「我方」画在自己这一侧（下方），红方棋子用红字、
+    黑方用黑字。取的是格子中心的笔画像素，用 `R - B` 区分 —— 木色棋盘本身
+    R 也大于 B，所以必须先靠「比周围暗」把笔画挑出来再判色。
+    """
+    inked, reddish = _bottom_row_ink(img, geom)
     if inked == 0:
         return RED  # 一片空白（比如大厅画面）：给个安全默认值，别抛异常
     return RED if reddish * 2 >= inked else BLACK
+
+
+def _adopt_side(args: argparse.Namespace, window, geom: BoardGeometry, my_side: int) -> int:
+    """换了一局之后重新判定我方执色。
+
+    小程序**每一局都可能换边**：这一局让你执红，下一局让你执黑。而 `mapper` /
+    `mouse` / 记谱都绑死了开局判出来的执色 —— 不重判的话，第二局会把整块棋盘
+    认反（180° 镜像），点出去的坐标也跟着镜像，结果是「替对手走棋」或者一直
+    「点击后局面校验失败」。
+
+    判定要看最下面那一排棋子的字色，所以得等棋子真的画出来。等不到就沿用
+    原来的执色（宁可照旧，也不要凭一片空白猜一个）。
+    """
+    if args.side != "auto":
+        return my_side  # `--side red/black` 是用户钉死的，永远不重判
+    deadline = time.monotonic() + SIDE_REDETECT_WAIT_S
+    while True:
+        frame = grab_usable(window)
+        if frame is not None:
+            inked, reddish = _bottom_row_ink(frame, geom)
+            if inked >= SIDE_MIN_INK_CELLS:
+                side = RED if reddish * 2 >= inked else BLACK
+                print(f"这一局自动判定我方执{'红' if side == RED else '黑'}")
+                return side
+        if time.monotonic() >= deadline:
+            print("看不清这一局谁执红，沿用上一局的执色。", file=sys.stderr)
+            return my_side
+        time.sleep(0.3)
 
 
 def resolve_side(name: str, img: np.ndarray | None, geom: BoardGeometry | None) -> int:
@@ -811,6 +854,14 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 if geom is None:
                     break
                 last_geom = geom
+                # 每一局都可能换边：上一局执红、这一局让执黑。执色绑在 `mapper` /
+                # `mouse` / 记谱三处，换局时不重判的话，整块棋盘会被认反（180°），
+                # 点出去的坐标也跟着镜像 —— 就成了「替对手走棋」。
+                side_now = _adopt_side(args, window, geom, my_side)
+                if side_now != my_side:
+                    my_side = side_now
+                    mapper = ScreenMapper(my_side)
+                    mouse.my_side = my_side
                 # 开下一局：会话、记谱、逐帧状态全部重置。
                 latest["board"] = None
                 settle.reset()
@@ -822,7 +873,7 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 last_locate = time.monotonic()
                 session, recorder, started = new_round()
                 saved = False
-                print(f"第 {finished + 1} 局开始。")
+                print(f"第 {finished + 1} 局开始（我方执{'红' if my_side == RED else '黑'}）。")
                 continue
 
             img = grab_usable(window)
