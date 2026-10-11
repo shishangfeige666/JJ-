@@ -51,6 +51,18 @@ _CORE_SCALE = 0.72
 _CORE_PX = max(9, round(TEMPLATE_PX * (ROI_SCALE / SEARCH_SCALE) * _CORE_SCALE))
 #: 建模板时把同类样本互相平移对齐的搜索半径（模板像素）。
 _ALIGN_RADIUS = 8
+#: 比对时只拿棋子正中心这一块（单位：格）。
+#:
+#: 游戏会给**刚走的那颗子**套一圈彩色光圈（红方红圈、黑方绿圈），光圈正好压在
+#: 棋子外缘上，整格比对时这颗子的分数会从 0.85 掉到 **0.52**，低于 `conf_min`
+#: 就被当成空格 —— 模型每走一步就凭空少一颗子，`interpret` 再照着错局面编出
+#: 一个自圆其说的假着法，一局下来彻底跑偏。实测只比中心 0.75 格，光圈进不来，
+#: 分数回到 0.71~0.80。
+MATCH_CORE_CELLS = 0.75
+#: 模板参与比对的核心边长。
+_MATCH_TPL_PX = max(9, round(TEMPLATE_PX * MATCH_CORE_CELLS / ROI_SCALE))
+#: 窗口参与比对的核心边长 —— 比模板核心大一圈，留出滑动对齐的余量。
+_MATCH_WIN_PX = _MATCH_TPL_PX + 2 * _ALIGN_RADIUS
 #: CLAHE 的对比度限制与分块 —— 抹掉棋盘上从左到右的渐变阴影，让同类棋子可比。
 _CLAHE_CLIP = 2.0
 _CLAHE_TILES = (8, 8)
@@ -125,15 +137,31 @@ def laplacian_variance(patch: np.ndarray) -> float:
     return float(cv2.Laplacian(core, cv2.CV_64F).var())
 
 
+def _center_crop(img: np.ndarray, side: int) -> np.ndarray:
+    """取正中间 `side x side` 的一块（超出原图就退回原图）。"""
+    side = min(side, img.shape[0], img.shape[1])
+    y0 = (img.shape[0] - side) // 2
+    x0 = (img.shape[1] - side) // 2
+    return img[y0 : y0 + side, x0 : x0 + side]
+
+
 def _peak_score(window: np.ndarray, template: np.ndarray) -> float:
     """模板在窗口里滑动，取最高的归一化相关。`TM_CCOEFF_NORMED` 先减均值，
-    所以对整体亮度差异不敏感（实测亮度整体缩放 1.3 倍后相关仍有 0.998）。"""
+    所以对整体亮度差异不敏感（实测亮度整体缩放 1.3 倍后相关仍有 0.998）。
+
+    **只比中心那块**（见 `MATCH_CORE_CELLS`）：游戏给刚走的那颗子套的光圈在棋子
+    外缘，整格比对会被它带崩。
+    """
     if window.shape[0] < template.shape[0] or window.shape[1] < template.shape[1]:
         raise ValueError(
             f"匹配窗口 {window.shape[:2]} 比模板 {template.shape[:2]} 还小；"
             f"请用 make_patch() 取窗口，而不是 reference_patch()"
         )
-    score = float(cv2.matchTemplate(window, template, cv2.TM_CCOEFF_NORMED).max())
+    win = _center_crop(window, _MATCH_WIN_PX)
+    tpl = _center_crop(template, _MATCH_TPL_PX)
+    if win.shape[0] < tpl.shape[0] or win.shape[1] < tpl.shape[1]:
+        win = tpl = _center_crop(tpl, min(win.shape[0], win.shape[1]))
+    score = float(cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED).max())
     return score if np.isfinite(score) else -1.0
 
 

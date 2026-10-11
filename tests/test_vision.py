@@ -31,7 +31,10 @@ pytestmark = pytest.mark.skipif(
     reason="缺少真机 fixture 或 config/templates.npz（先跑 tools/calibrate.py --build）",
 )
 
-# 中局帧由 Task 10 的后续补交（要靠真人对局产生，合成图对识别没有价值）
+# 真机中局帧。`mid_01` 是**带光圈**的一帧：黑砲吃了我们的馬落在 h0，游戏给这颗子套了
+# 一圈绿光 —— 整格模板匹配会被光圈带崩（分数 0.85 → 0.52，低于 conf_min 就当空格），
+# 于是模型每走一步凭空少一颗子。这条 fixture 是那个 bug 的回归证据。
+# 其余名字留给后续真人对局补交（合成图对识别没有价值）。
 MID_CASES = ["mid_01", "mid_02", "mid_03"]
 
 
@@ -115,14 +118,29 @@ def test_中局识别正确(name):
 
 
 def test_选中高亮帧仍能识别(opening):
-    """走子前点一下棋子会画一圈高亮，高亮会盖住棋子边缘 —— 识别不能因此崩掉。"""
+    """游戏会给「刚走的那颗子」套一圈光圈，光圈压在棋子外缘上。
+
+    ⚠️ 真正的回归证据是 `mid_01.png`（真机帧，整格比对时会漏掉 h0 的黑砲）；
+    这条合成用例只能把光圈画到「整格分数 0.63」的程度，压不到 `conf_min` 以下，
+    所以它是**辅助**而不是主判据 —— 留着的意义是覆盖「光圈不改变识别结果」这条不变式。
+    """
     img, geom, templates, expect = opening
     hi = img.copy()
     x, y = geom.cell_to_px(0, 1)
-    cv2.circle(hi, (round(x), round(y)), round(geom.cell_px * 0.6), (0, 215, 255), 8)
+    ring = np.zeros_like(hi)
+    cv2.circle(
+        ring,
+        (round(x), round(y)),
+        round(geom.cell_px * 0.62),
+        (60, 255, 60),
+        max(6, round(geom.cell_px * 0.20)),
+    )
+    ring = cv2.GaussianBlur(ring, (0, 0), geom.cell_px * 0.10)
+    hi = cv2.addWeighted(hi, 1.0, ring, 1.0, 0)
 
     rec = recognize(hi, geom, templates, ScreenMapper(geo.RED))
     assert rec.board.grid.tolist() == expect.grid.tolist()
+    assert rec.unknown == []
 
 
 def test_执黑视角识别(opening):
