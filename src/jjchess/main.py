@@ -127,6 +127,22 @@ NEW_BOARD_WAIT_S = 20.0
 #: `locate()` 会被空的装饰棋盘骗到（见主循环里那段注释），所以定位成功之后还得数一数。
 MIN_PIECES_ON_BOARD = 2
 
+#: 复查时「新拟合的几何还算同一个棋盘」的容差（原点像素 / 格距像素）。
+#
+# 真机踩过一次：换局那一下画面正在过渡，`locate()` 拟合出的网格**纵向偏了 6 像素**
+# （origin y = 602.69，正常 609.1）。偏一点点平时看不出来，但有子走到红方底线那排时，
+# 那一格的匹配置信度掉到 0.37 被判 `unknown`，而 `recognize` 把认不出的格子当**空**处理
+# —— 「画面上多了一个子」在会话眼里变成「什么都没变」，直接早退。脚本就这么停在那里
+# 一动不动十几分钟。差一点点就换过去，能自愈；差得多（比如「正在匹配」页面上那块装饰
+# 棋盘，格距 121 对真棋盘 154）说明这一帧根本不是真棋盘，宁可不换。
+GEOM_CLOSE_PX = 25.0
+GEOM_CLOSE_CELL_PX = 6.0
+
+#: 「有几格认不出来」这条提醒最多多久打一次（秒）。
+#: 几何一直偏着的话每帧都会撞上，不节流就是 20 行/秒地刷屏。
+UNKNOWN_WARN_EVERY_S = 5.0
+_unknown_warn_at = 0.0
+
 
 # ================================================================ 命令行
 
@@ -549,6 +565,67 @@ def _handle_delay_hotkeys(keys: set[str], session: Session, mouse: Mouse) -> Non
             print("收到退出指令（ESC）")
 
 
+def geom_close(
+    new: BoardGeometry,
+    old: BoardGeometry,
+    tol_px: float = GEOM_CLOSE_PX,
+    tol_cell: float = GEOM_CLOSE_CELL_PX,
+) -> bool:
+    """新拟合的几何是不是「同一个棋盘，只是更准一点」。
+
+    为什么要比这一下：几何只在开局/换局时定位一次，之后一直复用，而换局那一下画面
+    正在过渡，`locate()` 可能拟合出一个偏了几像素的网格。偏一点点就换过去能自愈；
+    差得多说明这一帧根本不是真棋盘（「正在匹配」页面上那块装饰棋盘格距只有 121，
+    真棋盘 154），宁可不换。常量的来历见 `GEOM_CLOSE_PX` 上面的注释。
+    """
+    if abs(new.origin[0] - old.origin[0]) > tol_px:
+        return False
+    if abs(new.origin[1] - old.origin[1]) > tol_px:
+        return False
+    return abs(new.dx - old.dx) <= tol_cell and abs(new.dy - old.dy) <= tol_cell
+
+
+def _retry_unknown(img, geom, templates, mapper, cfg, rec):
+    """认出棋盘了、但有几格没认出来时，换个刚拟合的几何再认一遍。
+
+    `recognize` 把认不出的格子当**空**处理，这是最危险的一种错：画面上明明多了一个子，
+    会话看到的却是「什么都没变」，`_grid_diff == 0` 直接早退，脚本停在那儿一动不动
+    （真机踩过，停了十几分钟）。换个几何认干净了就换过去；认不干净就原样返回，
+    交给上层照旧处理，并打一条节流提醒。
+
+    换过去之前还要过一道 `geom_close`：新拟合的几何得是「同一个棋盘、只是更准一点」。
+    差得太多说明这一帧根本不是真棋盘（「正在匹配」页面上那块装饰棋盘格距只有 121），
+    那就宁可不换。
+    """
+    global _unknown_warn_at
+    try:
+        fresh = locate(img)
+    except BoardNotFound:
+        fresh = None
+    if (
+        fresh is not None
+        and geom_close(fresh, geom)
+        and count_pieces(img, fresh) >= MIN_PIECES_ON_BOARD
+    ):
+        retry = recognize(img, fresh, templates, mapper, side_to_move=RED, conf_min=cfg.conf_min)
+        if retry is not None and not retry.unknown:
+            return retry
+    now = time.monotonic()
+    if not both_kings_present(rec.board):
+        # 双方将帅都不在，那根本不是一个棋局画面（「正在匹配」、大厅、结算弹窗都会
+        # 认出一盘几乎全空的棋）。上层会把它当「棋盘已消失」处理，这里就别再刷
+        # 「有 N 格认不出来」了 —— 那块空棋盘当然格格里都认不出东西。
+        return rec
+    if now - _unknown_warn_at >= UNKNOWN_WARN_EVERY_S:
+        _unknown_warn_at = now
+        cells = "、".join(f"第 {r} 行第 {c} 列" for r, c in rec.unknown[:3])
+        print(
+            f"[画面] 有 {len(rec.unknown)} 格认不出来（{cells}），这一帧先照旧认",
+            file=sys.stderr,
+        )
+    return rec
+
+
 def is_result_screen(img) -> bool:
     """画面底部那个绿色的「再来一局」按钮在不在。
 
@@ -741,17 +818,31 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 geom = None
             now = time.monotonic()
             if geom is not None and now - last_locate >= RELOCATE_EVERY_S:
-                # 定期回头确认「棋盘还在不在」。
+                # 定期回头确认「棋盘还在不在」，顺便**把漂掉的几何纠回来**。
                 #
-                # 这里是真机踩出来的一个死角：棋盘一旦定位成功，`geom` 就一直被复用，
+                # 「还在不在」这一半的来历：棋盘一旦定位成功，`geom` 就一直被复用，
                 # 于是 `locate()` 再也不会被调用 —— 那条「找不到棋盘 → `BoardNotFound`
                 # → 棋盘消失 → `GAME_OVER`」的路**在实战里从来没被走过**。对局结束时
                 # 画面切到结算弹窗，拿旧几何去认会得到一盘空棋（或者一帧面目全非的
                 # 乱子），会话读到的是「局面不对」而不是「棋盘没了」，最后被误报成
-                # 「点击后局面校验失败」暂停。
+                # 「点击后局面校验失败」暂停。所以每 `RELOCATE_EVERY_S` 秒复查一次：
+                # 查不到就把 `geom` 清掉，让下一帧走回 `BoardNotFound` 那条老路。
                 #
-                # 所以每 `RELOCATE_EVERY_S` 秒复查一次：查不到就把 `geom` 清掉，
-                # 让下一帧走回 `BoardNotFound` 那条老路。复查本身只花约 12ms。
+                # 「纠回来」这一半的来历（真机第二次踩）：几何只在开局/换局时定位一次，
+                # 而换局那一下画面正在过渡，拟合可能**偏几像素**（实测 origin y 602.69，
+                # 正常 609.1）。偏一点点平时没事，可一旦有子走到红方底线那排，那格的
+                # 匹配置信度会掉到 0.37 被判 `unknown`，而 `recognize` 把认不出的格子当
+                # **空**处理 —— 「画面上多了一个子」在会话眼里变成「什么都没变」，
+                # `_grid_diff == 0` 直接早退；`opponent_idle_sec` 默认是 0（用户要求：
+                # 对方想多久都等，不许因为局面静止就收摊），于是脚本停在那里一动不动
+                # 十几分钟。
+                #
+                # 纠偏**不在这里做**：`locate()` 自己每次都会抖 ±1.5 像素，每 2 秒换一次
+                # 几何等于让采样窗口一直晃，反而把临界格晃出更多 `unknown`（真机实测：
+                # 每 2 秒换一次的版本跑一分钟就撞上「点击后局面校验失败」）。
+                # 换几何只在一个明确信号下做 —— 见 `_retry_unknown`。
+                #
+                # 复查本身只花约 12ms。
                 last_locate = now
                 try:
                     locate(img)
@@ -789,6 +880,14 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 rec = recognize(
                     img, geom, templates, mapper, side_to_move=RED, conf_min=cfg.conf_min
                 )
+                if rec is not None and rec.unknown:
+                    # 有几格认不出来 —— 换个「这一帧刚拟合出来」的几何再认一遍。
+                    #
+                    # `recognize` 把认不出的格子当**空**处理，这是最危险的一种错：
+                    # 画面上明明多了一个子，会话看到的却是「什么都没变」。真机踩过一次
+                    # （几何纵向偏 6 像素，红方底线那格置信度掉到 0.37），脚本因此停了
+                    # 十几分钟不动。认干净了就换过去。
+                    rec = _retry_unknown(img, geom, templates, mapper, cfg, rec)
                 if rec is not None and not both_kings_present(rec.board):
                     # 结算画面（「再来一局」弹窗）定位不了棋盘，可 `geom` 一直在复用，
                     # 于是拿旧几何去认会得到一盘空棋。那不是局面，是「画面没了」。

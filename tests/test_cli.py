@@ -23,10 +23,12 @@ from jjchess.main import (
     FrameSettle,
     _next_round,
     _play,
+    _retry_unknown,
     build_parser,
     count_pieces,
     detect_side,
     dump_frame,
+    geom_close,
     grab_usable,
     log_state,
     main,
@@ -868,3 +870,85 @@ def test_主循环里空棋盘也不认(tmp_path, monkeypatch, capsys):
     assert _play(args, Config(debug_dir=tmp_path), _LoopWindow(), _StubEngine()) == EXIT_NO_FRAME
     assert calls["recognize"] == 0, "空棋盘不该拿去识别"
     assert "棋盘重新定位" not in capsys.readouterr().out
+
+
+# ------------------------------------------------------- 几何漂移与认不出的格子
+#
+# 真机第二次卡死（停了十几分钟不动）的两个成因，各配一条测试钉住。
+
+
+def test_几何只偏一点点就换过去():
+    """换局那一下拟合出来的网格可能偏几像素，复查时应当换过去自愈。
+
+    真机实测：第 2 局的几何是 `origin=(101.61, 602.69), dx=154.56`，正常应当是
+    `origin≈(101.5, 609.3)` —— 纵向偏了 6 像素。
+    """
+    old = BoardGeometry(
+        origin=(101.607, 602.686), dx=154.558, dy=148.012, cell_px=125.810
+    )
+    better = BoardGeometry(
+        origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850
+    )
+    assert geom_close(better, old)
+
+
+def test_装饰棋盘的几何不算同一个棋盘():
+    """「正在匹配」页面上那块空棋盘拟合出来的格距只有 121，差得太多，绝不能换过去。"""
+    real = BoardGeometry(
+        origin=(101.523, 609.322), dx=154.573, dy=148.059, cell_px=125.850
+    )
+    fake = BoardGeometry(
+        origin=(241.30, 380.44), dx=121.35, dy=120.77, cell_px=102.65
+    )
+    assert not geom_close(fake, real)
+
+
+def test_认不出来的格子会换个几何再认一遍(monkeypatch):
+    """`recognize` 把认不出的格子当**空**，换个几何认干净了就必须换过去。
+
+    真机现场：几何偏 6 像素时红方底线那格（黑車刚落上去）置信度只有 **0.366** 被判
+    `unknown`，于是「画面上多了一个子」在会话眼里变成「什么都没变」，`_grid_diff == 0`
+    直接早退，脚本停在那儿一动不动。用当时那份几何重跑识别，得到的正是模型里那个盘子。
+    """
+    from jjchess.vision.locator import BoardNotFound  # noqa: F401  （桩里会抛）
+    from jjchess.vision.recognizer import Recognition
+
+    stale = BoardGeometry(origin=(101.607, 602.686), dx=154.558, dy=148.012, cell_px=125.810)
+    fresh = BoardGeometry(origin=(100.328, 608.907), dx=154.730, dy=148.140, cell_px=125.980)
+    dirty = Recognition(
+        board=Board.from_fen(START_FEN), confidence=np.ones((10, 9), np.float32), unknown=[(9, 1)]
+    )
+    clean = Recognition(
+        board=Board.from_fen(START_FEN), confidence=np.ones((10, 9), np.float32), unknown=[]
+    )
+
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: fresh)
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 16)
+    monkeypatch.setattr("jjchess.main.recognize", lambda *_a, **_k: clean)
+
+    got = _retry_unknown(
+        _good(), stale, None, ScreenMapper(RED), Config(), dirty
+    )
+    assert got is clean, "换个几何认干净了就该用新的那份"
+
+
+def test_换了几何还是认不出来就原样返回(monkeypatch, capsys):
+    """认不干净时不能把这一帧丢掉 —— 丢掉会被会话读成「棋盘没了」，10 秒后误判终局。"""
+    from jjchess.vision.recognizer import Recognition
+
+    stale = _FAKE_GEOM
+    dirty = Recognition(
+        board=Board.from_fen(START_FEN), confidence=np.ones((10, 9), np.float32), unknown=[(9, 1)]
+    )
+    still = Recognition(
+        board=Board.from_fen(START_FEN), confidence=np.ones((10, 9), np.float32), unknown=[(9, 1)]
+    )
+
+    monkeypatch.setattr("jjchess.main.locate", lambda _img: stale)
+    monkeypatch.setattr("jjchess.main.count_pieces", lambda *_a, **_k: 16)
+    monkeypatch.setattr("jjchess.main.recognize", lambda *_a, **_k: still)
+    monkeypatch.setattr("jjchess.main._unknown_warn_at", 0.0)
+
+    got = _retry_unknown(_good(), stale, None, ScreenMapper(RED), Config(), dirty)
+    assert got is dirty
+    assert "格认不出来" in capsys.readouterr().err
