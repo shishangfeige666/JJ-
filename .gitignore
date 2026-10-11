@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -10,3 +10,7 @@ config/templates.npz
 vendor/
 # 调试截图
 debug/
+# 对局记录（中文记谱导出）
+records/
+# 临时探针脚本与日志
+_probe/
