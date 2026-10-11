@@ -8,7 +8,7 @@
 
 ## 1. 目标与成功标准
 
-做一个 Python 程序，对微信小游戏「JJ象棋」实现**全自动托管下棋**：自动找到游戏窗口 → 自动识别棋盘上 32 个棋子的位置 → 用皮卡鱼（Pikafish）算出最佳着法 → 自动操作鼠标完成走子 → 循环直到对局结束；同时提供一个实时可视化面板用于观察识别与思考过程。
+做一个 Python 程序，对微信小游戏「JJ象棋」实现**全自动托管下棋**：自动找到游戏窗口 → 自动识别棋盘上 32 个棋子的位置 → 用皮卡鱼（Pikafish）算出最佳着法 → 自动操作鼠标完成走子 → 循环直到对局结束；同时提供一个实时可视化面板用于观察识别与思考过程，并在对局结束后导出中文记谱。
 
 **成功标准**
 
@@ -20,6 +20,8 @@
 | S4 | 皮卡鱼能算出正确杀棋着法 | `tests/test_uci.py` 用已知杀局断言 bestmove |
 | S5 | 单步端到端（识别→思考→点击→校验）< 4 秒 | 运行时日志计时 |
 | S6 | 全程可中断 | `F8` 暂停即时生效，`ESC` 退出 |
+| S7 | 拟人化思考延迟生效 | `--human-delay` 开启后每步额外停顿落在 `[min_s, max_s]`；且**延迟期间 `F8`/`ESC` 仍即时响应** |
+| S8 | 对局记录可导出 | 结束后生成中文记谱 txt，着法序列与对局完全一致，可被 `tests/test_record.py` 断言 |
 
 **非目标（YAGNI，明确不做）**
 
@@ -27,6 +29,7 @@
 - 不做多开、不做后台多账号
 - 不做胜率统计、不做云库开局库
 - 不做安卓模拟器 / 手机 adb 支持（本机是微信电脑版原生窗口）
+- 不做标准 PGN 格式导出（象棋无统一 PGN 标准，只出中文记谱 + ICCS 行）
 
 ---
 
@@ -271,8 +274,16 @@ class Mouse:
 ```
 
 - `SetCursorPos` + `SendInput`（`MOUSEEVENTF_LEFTDOWN/LEFTUP`，绝对坐标 `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`，归一化到 `0..65535`）
-- **拟人化**：落点加 ±`jitter_px` 随机偏移；按下→抬起间隔 `60~140ms`；起止两点之间 `180~350ms`
+- **拟人化（点击层面）**：落点加 ±`jitter_px` 随机偏移；按下→抬起间隔 `60~140ms`；起止两点之间 `180~350ms`
 - `dry_run=True` 只打印坐标不点击（`--dry-run`），用于安全联调
+
+**拟人化（思考层面）`--human-delay`** —— 避免"每步都秒回"暴露脚本特征：
+
+- CLI：`--human-delay [MIN-MAX]`，裸写 `--human-delay` 等价 `--human-delay 0.5-2.0`（单位秒，浮点）
+- 配置：`"human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 }`；`enabled=false` 时 CLI 传入的区间也视为关闭
+- 实现在 `session.py` 的 `THINKING → PLAYING` 之间：`analyse()` 返回后再停 `random.uniform(min_s, max_s)`
+- ⚠️ **该停顿必须可中断**（S6 要求）：不能一次 `time.sleep(2.0)`，而要**切成 ≤50ms 的片段轮询暂停/退出标志**，保证 `F8`/`ESC` 在延迟期间仍即时生效
+- 停顿期间面板状态显示 `THINKING (human delay 1.3s)`，让使用者看得见它在"装思考"
 
 ### 4.8 `src/jjchess/session.py` —— 会话状态机（**鲁棒性核心**）
 
@@ -312,7 +323,50 @@ cur  = 本帧识别结果
 
 **终局检测**：局面连续 12 秒不变 且 非我方回合，或检测到底部弹出按钮区域亮度突增 → 判定对局结束，停止并打印对局记录。
 
-### 4.9 `src/jjchess/ui/panel.py` —— 实时可视化面板
+### 4.9 `src/jjchess/record.py` —— 对局记录与中文记谱导出
+
+```python
+@dataclass
+class MoveRecord:
+    ply: int                # 从 1 开始的半步序号
+    side: str               # "red" | "black"
+    iccs: str               # "h2e2"
+    chinese: str            # "炮二平五"
+    score_cp: int | None    # 我方着法才有；对手着法为 None
+    mate_in: int | None
+    depth: int | None
+    think_ms: int | None
+
+class GameRecorder:
+    def __init__(self, my_side: str, start_fen: str, started_at: datetime): ...
+    def add(self, board_before: Board, mv: Move,
+            analysis: Analysis | None = None, think_ms: int | None = None) -> MoveRecord: ...
+    def to_text(self) -> str            # 中文记谱 txt 全文
+    def iccs_line(self) -> str          # "h2e2 h9g7 h0g2 ..." 单行，便于程序复用
+    def save(self, path: Path) -> None  # 写 UTF-8 文件
+```
+
+- 中文记谱复用已存在的 `rules/notation.py`（面板 PV 显示也在用它），不重复实现
+- 记谱规则：**红方用汉字数字一~九（从红方右手边数起），黑方用阿拉伯数字 1~9（从黑方右手边数起）**；同一纵线两个同名子用"前/后"区分
+- 导出路径：`<debug-dir>/game-YYYYmmdd-HHMMSS.txt`；未指定 `--debug-dir` 时写到 `records/`
+- 终局时（`GAME_OVER`）自动保存；`ESC` 手动退出时也保存一次，避免丢记录
+- 导出格式示例：
+
+```
+JJ象棋 对局记录
+开始时间: 2026-10-11 15:30:22
+我方执色: 红
+初始局面: rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1
+结束原因: 用户退出
+
+ 1. 红 炮二平五   (h2e2)  +27   d22  1203ms
+ 1. 黑 马8进7     (h9g7)
+ 2. 红 马二进三   (h0g2)  +19   d21  1198ms
+
+ICCS: h2e2 h9g7 h0g2
+```
+
+### 4.10 `src/jjchess/ui/panel.py` —— 实时可视化面板
 
 复用 OpenCV（零额外依赖），单窗口合成图，主循环内 `cv2.imshow` + `cv2.waitKey(1)`：
 
@@ -329,13 +383,14 @@ cur  = 本帧识别结果
 | `F10` | 切换 dry-run（只打印不点击） |
 | `ESC` | 立即退出 |
 
-### 4.10 `src/jjchess/main.py` —— 组装与入口
+### 4.11 `src/jjchess/main.py` —— 组装与入口
 
 `argparse` CLI：
 
 ```
 uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
+               [--human-delay [MIN-MAX]] [--no-record]
 ```
 
 主循环：`grab → locate(首帧) → recognize → session.step → panel.render → hotkeys` 循环，目标 4~6 FPS。
@@ -441,16 +496,19 @@ JJ/
 │   ├── geometry.py
 │   ├── control.py
 │   ├── session.py
+│   ├── record.py
 │   ├── main.py
 │   ├── vision/{__init__,locator,templates,recognizer}.py
 │   ├── rules/{__init__,board,moves,notation}.py
 │   ├── engine/{__init__,uci,fallback}.py
 │   └── ui/{__init__,panel,hotkeys}.py
 ├── tools/{fetch_pikafish.py,calibrate.py,record_frames.py}
+├── records/                  # 对局记谱导出（生成物）
 └── tests/
     ├── test_geometry.py      ├── test_fen.py
     ├── test_moves.py         ├── test_notation.py
     ├── test_vision.py        ├── test_uci.py
+    ├── test_record.py        ├── test_session.py
     └── fixtures/*.png
 ```
 
@@ -487,6 +545,7 @@ default = true
 | `test_vision.py` | fixture 帧（开局 + 中局若干）识别 100%；含"选中高亮"帧的鲁棒性 |
 | `test_uci.py` | `skipif(not engine_present)`；已知杀局断言 bestmove；断言非法 FEN 时 wrapper 不崩溃（重启引擎） |
 | `test_session.py` | 合法着法解释器：构造"单格误识别"输入，断言被正确纠正；构造"无法解释"输入，断言进入告警 |
+| `test_record.py` | `GameRecorder` 逐步累积后 `to_text()` 断言着法/记谱/ICCS 行完全一致；`--human-delay` 区间解析（`"0.5-2.0"` / 裸开关 / 非法串拒绝）；可中断睡眠在暂停标志置位后提前返回 |
 | 端到端 | `--dry-run` + 录制帧序列，跑完整管线不断言点击 |
 
 ---
@@ -509,10 +568,10 @@ default = true
 
 ---
 
-## 9. 待评审确认点
+## 9. 评审结论（2026-10-11 已确认）
 
-1. 模块划分与目录结构是否认可
-2. 识别方案（模板匹配 + 合法着法解释器纠错）是否认可 —— 相比"训练 CNN 分类"更轻量、可解释、无需标注数据
-3. 思考时间默认 **1200ms**（可 `--movetime` 调整）是否合适 —— 实测本机 **14.5 Mnps**（16 线程），1200ms 可搜到 depth 20+，远超人类；对局总时长 30 分钟，按 60 步估算共耗约 72 秒，余量充足
-4. 是否需要"记谱导出"（把整局走法存成中文记谱 txt）—— 目前列为可选，默认关闭
-5. 是否需要"拟人化思考延迟"（在引擎结果外再加 0.5~2s 随机停顿，避免每步都秒回、显得像脚本）—— 目前未纳入，倾向加为 `--human-delay` 可选开关
+1. 模块划分与目录结构 —— ✅ 认可
+2. 识别方案（模板匹配 + 合法着法解释器纠错）—— ✅ 认可（相比"训练 CNN 分类"更轻量、可解释、无需标注数据）
+3. 思考时间默认 **1200ms**（可 `--movetime` 调整）—— ✅ 认可。实测本机 **14.5 Mnps**（16 线程），1200ms 可搜到 depth 20+，远超人类；对局总时长 30 分钟，按 60 步估算共耗约 72 秒，余量充足
+4. **拟人化思考延迟** —— ✅ **纳入**，`--human-delay`，见 §4.7
+5. **记谱导出** —— ✅ **纳入**，默认开启，`--no-record` 可关，见 §4.9
