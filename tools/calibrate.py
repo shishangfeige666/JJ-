@@ -164,17 +164,43 @@ def build(title: str) -> int:
     return 0
 
 
+def _to_image_coords(window_name: str, x: int, y: int, img_w: int, img_h: int) -> tuple[int, int]:
+    """把「显示窗口坐标」换算回「原图像素」。
+
+    `cv2.namedWindow(..., cv2.WINDOW_NORMAL)` 会把 1440x2560 这种大图**缩进屏幕**显示
+    （本机客户区实测就是 1440x2560，而屏幕只有 1440x900 那一档），
+    而 `setMouseCallback` 回调给的是**显示窗口**坐标。直接当原图像素用，
+    算出来的 `dx`/`dy` 会整体等比偏小 —— 而缩小后的几何**照样满足** `is_plausible()`
+    的三条相对判据（dx/dy 对称、`cell_px/min(dx,dy)` 本来就按比例构造），
+    一路写进 `config/calibration.json`，之后每一次落点都系统性偏向棋盘左上角，
+    越靠右下偏得越多。
+
+    窗口可以被用户随手拉伸，所以必须**在点击那一刻**问一次实际显示区域，
+    不能在标定开始时算一次就存着。
+    """
+    scale_x = scale_y = 1.0
+    try:
+        rect = cv2.getWindowImageRect(window_name)
+    except cv2.error:  # pragma: no cover - 窗口刚被关掉之类
+        rect = ()
+    if len(rect) == 4 and rect[2] > 0 and rect[3] > 0:
+        scale_x = img_w / float(rect[2])
+        scale_y = img_h / float(rect[3])
+    return round(x * scale_x), round(y * scale_y)
+
+
 def manual(title: str, out: Path) -> int:
     """鼠标点两个交叉点，反推 `BoardGeometry`。"""
     img = grab_frame(title)
     points: list[tuple[int, int]] = []
     display = img.copy()
-    window_name = "calibrate - click top-left then bottom-right intersection"
+    window_name = "标定：先点棋盘左上角交叉点，再点右下角交叉点"
 
     def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or len(points) >= 2:
             return
-        points.append((x, y))
+        # 画标记要用**显示坐标**，入 `points` 要用原图坐标 —— 两者不一定相等。
+        points.append(_to_image_coords(window_name, x, y, img.shape[1], img.shape[0]))
         cv2.drawMarker(display, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
         cv2.putText(
             display, str(len(points)), (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3

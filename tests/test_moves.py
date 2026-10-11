@@ -49,8 +49,25 @@ def test_炮必须隔一个炮架才能吃():
 
 
 def test_象不过河():
-    b = Board.from_fen("4k4/9/9/9/9/9/9/9/9/2E1K4 w - - 0 1")
-    assert all(not m.startswith("c0") or int(m[3]) <= 4 for m in generate(b))
+    """相/象走田字，但不能过河。
+
+    注意用例里的相必须摆在**河界边上**（rank 4）：摆在底线（rank 0）时它的两个
+    田字落点本来就在本方半场，这条断言无论规则在不在都通过 —— 是个恒真断言
+    （整分支评审实测：把 `_on_own_side` 判断去掉后，c0 相的着法集合一模一样，
+    perft(1..4) 也仍然是 44/1920/79666/3290240，因为红象跨河要走 5 个半步，
+    depth 4 采不到）。
+    """
+    edge = Board.from_fen("4k4/9/9/9/9/2E6/9/9/9/4K4 w - - 0 1")
+    moves = generate(edge)
+    assert "c4a2" in moves and "c4e2" in moves  # 往本方半场走没问题
+    assert "c4a6" not in moves and "c4e6" not in moves  # 过河的两步被挡掉
+
+    # 黑象对称：摆到 rank 5（黑方河界边上），不能走到 rank 3 及以下。
+    # FEN 字符串第 i 行对应棋盘 rank 9-i，所以 rank 5 写在第 5 行（下标 4）。
+    black = Board.from_fen("4k4/9/9/9/2e6/9/9/9/9/4K4 b - - 0 1")
+    black_moves = generate(black)
+    assert "c5a7" in black_moves and "c5e7" in black_moves
+    assert "c5a3" not in black_moves and "c5e3" not in black_moves
 
 
 def test_塞象眼():

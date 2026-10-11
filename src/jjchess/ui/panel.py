@@ -69,6 +69,10 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
     ("局面长时间不变，判定对局结束", "board unchanged for long, game over"),
     ("已经看不到棋盘了，判定对局结束", "board is gone, game over"),
     ("已暂停（按 F8 继续）", "PAUSED (F8 to resume)"),
+    (
+        "看不懂局面变化，已暂停（请检查识别）",
+        "cannot explain board change, paused (check vision)",
+    ),
     ("看不懂局面变化（第 ", "cannot explain board change (attempt "),
     ("引擎没有返回着法（第 ", "engine returned no move (attempt "),
     ("引擎给出的着法 ", "engine move "),

@@ -235,6 +235,17 @@ class Session:
         self._pause_requested = False
         back = self._state_before_pause
         self.state = State.MY_TURN if back is State.PAUSED else back
+        # 恢复时必须把两本账清零，否则 F8 会是个死键。
+        #
+        # 「请检查识别」这类自动暂停的语义就是「人看一眼、修好了再按 F8 继续」，
+        # 但 `_unexplained` 是按「看不懂的局面」累加的：暂停期间画面没变，
+        # 恢复后第一帧还是那个坏局面，同一个 FEN 不重复计数（见 `_count_unexplained`）
+        # 也就永远清不掉 —— 每一次 `step()` 都立刻回到暂停，消息一模一样，
+        # 只有 ESC 能出去。静止计时同理：暂停期间没人走棋，`_idle_since` 停在暂停前
+        # 那一刻，恢复后当场被判「局面长时间不变」而收摊。
+        self._idle_since = self.deps.now()
+        self._unexplained = 0
+        self._last_unexplained = None
         self.message = "继续"
 
     def request_stop(self) -> None:
@@ -313,16 +324,39 @@ class Session:
         if self._note_board(cur):
             return
         if cur is not None and self.board is not None and _grid_diff(cur, self.board) != 0:
-            # 轮到我方时局面却变了：可能是识别抖动，也可能对方真的走了。
             mv = interpret(self.board, cur, self.deps.config.tolerance_cells)
             if mv is not None:
-                self._adopt(mv, opponent=True)
+                # MY_TURN 的不变式是 `self.board.side == my_side`（`_step_idle`、
+                # `_adopt`、`_step_verify` 三处共同维持），而 `interpret` 只在
+                # `legal_moves(prev)` 里搜 —— 所以这里**只可能**解释出我方的着法。
+                #
+                # 「轮到我方时局面却变了」的真实含义只有一个：上一次点击其实打出去了，
+                # 只是画面确认超时把它当成没走成（`_step_verify` 的第 3 条出路），
+                # 或者点击成功但紧接着就被暂停了。这一步确实落下了。
+                #
+                # 早先这里按「对方真的走了」处理（`opponent=True`），后果是：引擎拿着
+                # 轮到黑方的 FEN 替**对方**算棋、鼠标替**对方**走子、记谱里多出一手根本
+                # 不是我方决策的着法。要在构造上可能，除非 `interpret` 能返回对方的着法。
+                #
+                # 补收时也要记谱：这一步从没走到过 `_step_verify` 的确认分支，
+                # 不记就漏了一手。
+                self._record_move(self.board, mv)
+                self._adopt(mv, opponent=False)
+                return
+            self._count_unexplained(
+                cur, State.MY_TURN, "看不懂局面变化，已暂停（请检查识别）"
+            )
+            return
         if self._check_idle():
             return
         self.state = State.THINKING
 
     def _step_thinking(self) -> None:
-        self._check_idle()
+        # 返回值不能丢：`_check_idle()` 会把状态改成 PAUSED（轮到我方却异常静止），
+        # 而下面第 367 行的 `self.state = State.PLAYING` 会把它盖回 PLAYING ——
+        # 面板和日志上写着「请检查」，实际却在继续点击。真机评审实测复现过。
+        if self._check_idle():
+            return
         board = self.board
         if board is None:  # pragma: no cover - 不该发生
             self.state = State.IDLE
@@ -379,8 +413,9 @@ class Session:
             return
 
         self.deps.mouse.play_move(mv, geom)
-        if self.deps.recorder is not None:
-            self.deps.recorder.add(before, mv, self.last_analysis, self._think_ms)
+        # 记谱**不在这里**写：点击可能根本没生效（`_step_verify` 超时后回到 `MY_TURN`
+        # 重新决策），提前写就会把一步没走成的着法留在记谱里；重试成功后再写一次，
+        # 同一回合就出现两手。`GameRecorder` 没有回滚接口，所以只能等确认。
         self._play_at = self.deps.now()
         self.message = f"已走 {mv}，等待画面确认"
         self.state = State.VERIFY
@@ -421,6 +456,7 @@ class Session:
             # 允许 `tolerance_cells` 格对不上：吃子那一瞬间抓到的帧可能正好少一格，
             # 为它把整步判失败太亏。对方真还了一着至少动 2 格（起点 + 终点），
             # 所以 `tol = 1` 不会把「对方已经还着」误判成「我方走成了」。
+            self._record_move(before, mv)
             self.board = expected
             self._idle_since = self.deps.now()
             self._pending_move = None
@@ -433,6 +469,7 @@ class Session:
             # 画面确实动了，只是比我方这步多走了一步 —— 对方的还着已经落下来了。
             reply = interpret(expected, cur, tol)
             if reply is not None:
+                self._record_move(before, mv)
                 self.board = expected
                 self._pending_move = None
                 self._board_before = None
@@ -471,38 +508,63 @@ class Session:
 
         mv = interpret(self.board, cur, self.deps.config.tolerance_cells)  # type: ignore[arg-type]
         if mv is None:
-            # 一个坏局面只记一次账。`board_provider()` 在新局面停稳之前会一直返回
-            # **同一个**已停稳的盘子，主循环一轮 0.1~0.2 秒，照着数次数的话一个坏帧
-            # 会被连数三次，`MAX_UNEXPLAINED = 3` 立刻误触发暂停（真机实测踩过）。
-            fen = cur.to_fen()
-            if fen != self._last_unexplained:
-                self._last_unexplained = fen
-                self._unexplained += 1
-            self.message = f"看不懂局面变化（第 {self._unexplained} 次）"
-            if self._unexplained >= MAX_UNEXPLAINED:
-                self._auto_pause(State.OPPONENT_TURN, "无法解释局面变化，已暂停（请检查识别）")
+            self._count_unexplained(
+                cur, State.OPPONENT_TURN, "无法解释局面变化，已暂停（请检查识别）"
+            )
             return
 
         self._adopt(mv, opponent=True)
 
     # ---------------------------------------------------------------- 工具
 
+    def _count_unexplained(self, cur: Board, resume_state: State, message: str) -> None:
+        """记一笔「画面变了但解释不出来」，够 `MAX_UNEXPLAINED` 次就停下来。
+
+        一个坏局面只记一次账：`board_provider()` 在新局面停稳之前会一直返回
+        **同一个**已停稳的盘子，主循环一轮 0.1~0.2 秒，照着数次数的话一个坏帧
+        会被连数三次，`MAX_UNEXPLAINED = 3` 立刻误触发暂停（真机实测踩过）。
+        """
+        fen = cur.to_fen()
+        if fen != self._last_unexplained:
+            self._last_unexplained = fen
+            self._unexplained += 1
+        self.message = f"看不懂局面变化（第 {self._unexplained} 次）"
+        if self._unexplained >= MAX_UNEXPLAINED:
+            self._auto_pause(resume_state, message)
+
+    def _record_move(self, before: Board, mv: str) -> None:
+        """把我方一步写进记谱。**只在确认走成之后调**（见 `_step_playing` 的注释）。"""
+        recorder = self.deps.recorder
+        if recorder is None:
+            return
+        analysis = self.last_analysis
+        think_ms = self._think_ms
+        if analysis is None or analysis.bestmove != mv:
+            # 补收的着法（`_step_my_turn` 那条路）或引擎压根没给分析 —— 不硬凑数据。
+            analysis, think_ms = None, None
+        recorder.add(before, mv, analysis, think_ms)
+
     def _adopt(self, mv: str, *, opponent: bool) -> None:
-        """采纳一步（对方走的），把局面推到**修正后**的样子并轮到我方。"""
+        """采纳一步，把局面推到**修正后**的样子。
+
+        `opponent=True` 是对方走的（采纳完轮到我方，并记进记谱）；
+        `opponent=False` 是**我方**自己已经落下的着法（校验超时后补收），采纳完轮到对方 ——
+        记谱由调用方在此之前用 `_record_move` 写，因为只有它知道这一手的分析数据。
+        """
         before = self.board
         if before is None:  # pragma: no cover - 不该发生
             self.state = State.IDLE
             return
         delta = before.copy()
         make(delta, mv)
-        if self.deps.recorder is not None:
+        if opponent and self.deps.recorder is not None:
             self.deps.recorder.add(before, mv, None, None)
         self.board = delta
         self._idle_since = self.deps.now()
         self._unexplained = 0
         self._last_unexplained = None
         self.message = f"对方走 {mv}" if opponent else f"走 {mv}"
-        self.state = State.MY_TURN
+        self.state = State.MY_TURN if opponent else State.OPPONENT_TURN
 
     def _note_board(self, cur: Board | None) -> bool:
         """记一笔「这次有没有读到棋盘」。`True` = 失联太久，已经转 `GAME_OVER`。

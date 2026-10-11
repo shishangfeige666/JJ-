@@ -31,7 +31,7 @@ import numpy as np
 from jjchess.config import DEFAULT_CONFIG_PATH, Config, load_config, parse_human_delay
 from jjchess.control import Mouse
 from jjchess.engine.fallback import FallbackEngine
-from jjchess.engine.uci import UciEngine, engine_present
+from jjchess.engine.uci import EngineError, UciEngine, engine_present
 from jjchess.geometry import BLACK, RED, BoardGeometry, ScreenMapper
 from jjchess.record import GameRecorder
 from jjchess.rules.board import START_FEN, Board
@@ -102,6 +102,8 @@ _MIN_INK_PIXELS = 30
 _INK_RADIUS_RATIO = 0.35
 
 EXIT_OK = 0
+#: 对局中途出了预料之外的错（不是窗口问题也不是抓图问题）。
+EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_NO_WINDOW = 2
 EXIT_NO_FRAME = 3
@@ -300,9 +302,16 @@ def _open_engine(cfg: Config):
     """有皮卡鱼就用皮卡鱼，没有就退回内置简易引擎（棋力很低，只保证能跑）。"""
     if engine_present(cfg.engine_path):
         print(f"引擎：{cfg.engine_path}（线程 {cfg.threads}，置换表 {cfg.hash_mb}MB）")
-        return UciEngine(
-            cfg.engine_path, threads=cfg.threads, hash_mb=cfg.hash_mb, nnue=cfg.nnue_path
-        )
+        try:
+            return UciEngine(
+                cfg.engine_path, threads=cfg.threads, hash_mb=cfg.hash_mb, nnue=cfg.nnue_path
+            )
+        except EngineError as exc:
+            # 握手失败（引擎被杀软删了、exe 架构不对、启动超时）。早先这里没有任何兜底：
+            # 异常穿出 `main()`，用户拿到的是英文 traceback，而我们明明有一个能用的
+            # 内置引擎可以退。
+            print(f"警告：皮卡鱼启动失败（{exc}），退回内置简易引擎（棋力很低）。", file=sys.stderr)
+            return FallbackEngine()
     print(
         f"警告：没找到皮卡鱼引擎 {cfg.engine_path}，退回内置简易引擎（棋力很低）。"
         "运行 `uv run python tools/fetch_pikafish.py` 可以自动下载。",
@@ -554,6 +563,7 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
     board_lost = False
     settle = FrameSettle()
     last_locate = time.monotonic()
+    exit_code = EXIT_OK
     try:
         while not session.should_stop:
             _handle_hotkeys(hotkeys.poll(), session, mouse)
@@ -574,7 +584,11 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 bad_streak += 1
                 if bad_streak >= MAX_BAD_STREAK:
                     print("错误：连续抓不到可用画面，退出。", file=sys.stderr)
-                    return EXIT_NO_FRAME
+                    # 早先这里是 `return EXIT_NO_FRAME` —— 从 `try` 里直接返回会**跳过**
+                    # 循环后面的 `panel.close()` 与 `_finish()`（没有 finally），
+                    # 这一局已经下过的着法就此丢失。把游戏窗口最小化几秒就能命中。
+                    exit_code = EXIT_NO_FRAME
+                    break
                 # [RF-2] 坏帧绝不能变成「棋盘空了」：只把这一帧的信息丢掉。
                 latest["board"] = None
                 rec = None
@@ -634,8 +648,17 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                     #
                     # 只在这一段「看不到棋盘」的**头一帧**打一次：结算画面停在那里之后
                     # 每帧都打，几十秒能刷几百行，把真正有用的日志淹掉。
+                    reason = "认不到双方将帅，当作棋盘已消失"
+                elif rec is not None and not rec.board.is_legal_position():
+                    # 将帅照面 / 将帅摆出九宫。这种局面喂给皮卡鱼，它会判
+                    # `CRITICAL ERROR` 并**自杀退出** —— 引擎层虽然有重启兜底，
+                    # 但白烧一次额度不说，模型一旦采纳了这种局面，后面全盘错位。
+                    reason = "认出的局面不合法（将帅照面或不在九宫），跳过这一帧"
+                else:
+                    reason = ""
+                if reason:
                     if not board_lost:
-                        print("[画面] 认不到双方将帅，当作棋盘已消失", file=sys.stderr)
+                        print(f"[画面] {reason}", file=sys.stderr)
                         board_lost = True
                     rec = None
                 else:
@@ -667,12 +690,21 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
             time.sleep(LOOP_SLEEP)
     except WindowNotFound as exc:
         print(f"窗口没了：{exc}", file=sys.stderr)
+        exit_code = EXIT_NO_WINDOW
     except KeyboardInterrupt:
         print("收到 Ctrl+C，正在退出…")
-
-    panel.close()
-    _finish(session, recorder, cfg, started)
-    return EXIT_OK
+    except Exception as exc:  # noqa: BLE001 - 兜住任何意外，保证收尾一定会跑
+        # `mouse.play_move` 会抛 `OSError`（`SetCursorPos`/`SendInput` 失败），
+        # `panel.render` 会抛 `cv2.error`，`engine.analyse` 的异常也在这里落地。
+        # 早先它们会直接穿出 `main()`：既跳过收尾（记谱丢失），又给用户一段
+        # 英文 traceback —— 而本项目的硬约束是「一切面向人的输出用中文」。
+        print(f"出错了：{exc}", file=sys.stderr)
+        exit_code = EXIT_FAILURE
+    finally:
+        # 收尾放在 `finally` 里，任何一条退出路径都跑得到。
+        panel.close()
+        _finish(session, recorder, cfg, started)
+    return exit_code
 
 
 def _finish(
@@ -688,7 +720,13 @@ def _finish(
         print("这局一步都没走过，不生成记谱文件。")
         return
     path = record_path(cfg.debug_dir, started)
-    recorder.save(path)
+    try:
+        recorder.save(path)
+    except OSError as exc:
+        # 目录不可写、磁盘满、文件被占用。这里的异常要是穿出去，用户看到的是英文
+        # traceback，而这一局明明已经走完了 —— 宁可丢记谱也要把中文原因说清楚。
+        print(f"警告：记谱写入失败（{exc}），这一局的记录没能保存。", file=sys.stderr)
+        return
     print(f"记谱已保存：{path}（共 {len(recorder.moves)} 步）")
 
 

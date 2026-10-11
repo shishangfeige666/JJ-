@@ -145,7 +145,14 @@ class GameRecorder:
         return "\n".join(lines) + "\n"
 
     def save(self, path: Path) -> None:
-        """写 UTF-8 文件，父目录不存在时自动创建。"""
+        """写 UTF-8 文件，父目录不存在时自动创建。
+
+        先写同目录下的临时文件再 `replace`：`write_text` 不是原子的，
+        写到一半被打断（磁盘满、进程被杀、目标被编辑器占住）会留下半截文件 ——
+        而那半截看起来跟正常记谱一模一样，只是少了后面几十手。
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_text(), encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(self.to_text(), encoding="utf-8")
+        tmp.replace(path)

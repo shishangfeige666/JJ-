@@ -45,7 +45,8 @@ def fake_board() -> np.ndarray:
 
 
 def test_大厅帧判定无棋盘():
-    img = cv2.imread(str(FIXTURES / "lobby.png"))  # [RF-3]
+    # 全仓统一用 `np.fromfile` + `imdecode`：`cv2.imread` 在非 ASCII 路径上会静默失败。
+    img = cv2.imdecode(np.fromfile(str(FIXTURES / "lobby.png"), dtype=np.uint8), cv2.IMREAD_COLOR)
     assert img is not None, "缺少 tests/fixtures/lobby.png"
     with pytest.raises(BoardNotFound):
         locate(img)
@@ -87,9 +88,20 @@ def test_峰数不足时拒绝硬凑():
 
 
 def test_真实开局帧能定位():
+    """真机开局帧的几何**逐个数字钉死**。
+
+    原来只断言 `60 < cell_px < 200` —— 真值 125.85，而 60~200 允许 ±60% 的误差，
+    任何「尺度对但整体缩小」的假解都落在里面，等于这条用例没有区分力。
+    合成帧那条用的是 `abs=2/abs=3`，真机帧没有理由更松。
+    fixture 是固定 PNG，`locate` 是确定性的。
+    """
     path = FIXTURES / "opening.png"
-    img = cv2.imread(str(path))
+    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
     assert img is not None, f"缺少 {path}"
     g = locate(img)
     assert g.is_plausible()
-    assert 60 < g.cell_px < 200
+    assert g.origin[0] == pytest.approx(101.52, abs=3)
+    assert g.origin[1] == pytest.approx(609.32, abs=3)
+    assert g.dx == pytest.approx(154.57, abs=2)
+    assert g.dy == pytest.approx(148.06, abs=2)
+    assert g.cell_px == pytest.approx(125.85, abs=2)

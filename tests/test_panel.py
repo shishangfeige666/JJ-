@@ -168,9 +168,13 @@ def test_状态文字是纯ASCII():
 def _session_messages() -> list[str]:
     """从 `session.py` 里刮出所有会被面板显示的消息文本。
 
-    只认 `self.message = ...` 与 `self._auto_pause(状态, ...)` 的第二参数 ——
-    这两种是**唯一**的出口，其它中文字符串（异常、日志）不走面板。
+    三个出口：`self.message = ...`、`self._auto_pause(状态, 消息)` 的第二参数、
+    `self._count_unexplained(局面, 状态, 消息)` 的**第三**参数。除此之外的中文字符串
+    （异常、日志）不走面板。
     f-string 里的插值统一换成 `X` 占位。
+
+    真实盲区：`_count_unexplained` 是后来把重复代码抽出来时加的，消息挪到了第 3 个参数上 ——
+    只认 `_auto_pause` 的话，它经手的两条消息再也不受保护，改了翻译也不会有人拦。
     """
     src = ROOT / "src" / "jjchess" / "session.py"
     tree = ast.parse(src.read_text(encoding="utf-8"))
@@ -188,6 +192,9 @@ def _session_messages() -> list[str]:
             return "".join(out)
         return None
 
+    #: 方法名 -> 消息在第几个位置参数上（0 起算）。
+    message_slots = {"_auto_pause": 1, "_count_unexplained": 2}
+
     found: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
@@ -197,8 +204,9 @@ def _session_messages() -> list[str]:
             if text:
                 found.append(text)
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "_auto_pause" and len(node.args) >= 2:
-                text = render(node.args[1])
+            slot = message_slots.get(node.func.attr)
+            if slot is not None and len(node.args) > slot:
+                text = render(node.args[slot])
                 if text:
                     found.append(text)
     return found

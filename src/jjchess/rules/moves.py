@@ -317,7 +317,12 @@ def legal_moves(board: Board) -> list[str]:
 
 
 def game_status(board: Board) -> str:
-    """判定当前局面：`ONGOING` / `CHECK` / `CHECKMATE` / `STALEMATE`。"""
+    """判定当前局面：`ONGOING` / `CHECK` / `CHECKMATE` / `STALEMATE`。
+
+    **注意 `STALEMATE`（困毙）在中国象棋里判负，不是和棋** —— 无着可走即输，
+    与围棋、国际象棋的「无棋可走作和」不同。调用方（`engine/fallback.py`）
+    按这个含义给分。
+    """
     g = board.grid.tolist()
     side = board.side
     if _legal_moves(g, side):

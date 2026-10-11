@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 
@@ -20,10 +21,12 @@ from jjchess.config import DEFAULTS, Config
 from jjchess.control import Mouse
 from jjchess.engine.uci import Analysis
 from jjchess.geometry import RED, BoardGeometry, ScreenMapper
+from jjchess.record import GameRecorder
 from jjchess.rules.board import START_FEN, Board
 from jjchess.rules.moves import legal_moves, make
 from jjchess.session import (
     BOARD_LOST_TIMEOUT_S,
+    MAX_UNEXPLAINED,
     VERIFY_TIMEOUT_S,
     Session,
     SessionDeps,
@@ -33,6 +36,10 @@ from jjchess.session import (
 )
 
 _FAKE_GEOM = BoardGeometry(origin=(100.0, 100.0), dx=80.0, dy=80.0, cell_px=64.0)
+
+
+def _recorder() -> GameRecorder:
+    return GameRecorder(RED, START_FEN, datetime.datetime(2026, 10, 11, 12, 0, 0))
 
 
 # ============================================================ 合法着法解释器
@@ -217,13 +224,14 @@ def _make_session(
     my_side: int = RED,
     clock: _Clock | None = None,
     delay_tick=None,
+    recorder: GameRecorder | None = None,
 ) -> Session:
     deps = SessionDeps(
         board_provider=provider if provider is not None else (lambda: None),
         engine=engine if engine is not None else _FakeEngine(),
         mouse=Mouse(dry_run=True, my_side=my_side),
         mapper=ScreenMapper(my_side),
-        recorder=None,
+        recorder=recorder,
         config=config if config is not None else DEFAULTS,
         geometry_provider=(lambda: geom),
         now=clock if clock is not None else time.monotonic,
@@ -839,3 +847,141 @@ def test_解释器不依赖网格可变性():
     b = a.copy()
     assert a.grid.tolist() == b.grid.tolist()
     assert not np.shares_memory(a.grid, b.grid)
+
+
+# ============================================================ 代码评审修复
+#
+# 下面这几条都是整分支评审（三个新鲜上下文评审员）报出来的真缺陷，每条先红后绿。
+
+
+def test_轮到我方时画面已落下我方着法要按我方采纳():
+    """`interpret` 在 MY_TURN 只可能解释出**我方**的着法，不能当成对方走的。
+
+    MY_TURN 的不变式是 `self.board.side == my_side`，而 `interpret` 只在
+    `legal_moves(prev)` 里搜 —— 所以「轮到我方时局面却变了」的真实含义只有一个：
+    上一次点击其实打出去了，只是画面确认超时把它当成了没走成。
+
+    早先这里按「对方真的走了」处理（`opponent=True`，状态留在 MY_TURN），后果是
+    引擎拿着**轮到黑方**的 FEN 替对方算棋、鼠标替对方走子、记谱里多出一手根本不是
+    我方决策的着法。真机上的表现是「暂停恢复之后机器人走出一手莫名其妙的棋」。
+    """
+    provider = _Provider(_model_board())
+    rec = _recorder()
+    s = _make_session(State.MY_TURN, provider=provider, recorder=rec)
+    landed = _model_board()
+    make(landed, "h2e2")  # 我方这一手其实已经落下去了
+    provider.board = landed
+
+    s.step()
+
+    assert s.state is State.OPPONENT_TURN, "我方着法落下之后该轮到对方"
+    assert s.board.side == -RED, "局面要推进到「我方走完」，轮到黑方"
+    assert s.message == "走 h2e2"
+    assert [m.iccs for m in rec.moves] == ["h2e2"]
+
+
+def test_恢复之后不会凭旧账立刻又暂停():
+    """`resume()` 必须清掉「看不懂局面」的记账，否则 F8 是个死键。
+
+    自动暂停的语义是「人看一眼、修好了再按 F8 继续」，但 `_unexplained` 是按
+    「看不懂的局面」累加的：暂停期间画面没变，恢复后第一帧还是那个坏局面，
+    同一个 FEN 不重复计数也就永远清不掉 —— 每一次 `step()` 都立刻回到暂停，
+    消息一模一样，只有 ESC 能出去。
+    """
+    provider = _Provider(_model_board())
+    s = _make_session(State.OPPONENT_TURN, provider=provider)
+    for drop in (1, 2, 3):
+        provider.board = _junk_board(drop)
+        s.step()
+    assert s.state is State.PAUSED
+    assert s._unexplained == MAX_UNEXPLAINED
+
+    s.resume()
+
+    assert s._unexplained == 0, "恢复时要把看不懂的记账清零"
+    assert s._last_unexplained is None
+    s.step()
+    assert s.state is not State.PAUSED, "恢复后又凭旧账立刻暂停了，F8 等于死键"
+    assert s._unexplained == 1
+    assert "第 1 次" in s.message
+
+
+def test_恢复之后不会因为暂停期间的时间被判终局():
+    """`resume()` 也要刷新静止计时：暂停期间没人走棋，旧时间戳会让恢复当场收摊。"""
+    clock = _Clock()
+    s = _make_session(
+        State.OPPONENT_TURN, provider=_Provider(_model_board()), clock=clock
+    )
+    clock.advance(1.0)
+    s.pause()
+    clock.advance(60.0)  # 人看了很久才按 F8
+    s.resume()
+
+    assert s._idle_since == clock.t, "静止计时要从恢复那一刻重新起算"
+    s.step()
+    assert s.state is not State.GAME_OVER
+
+
+def test_轮到我方时看不懂局面照样算账():
+    """MY_TURN 的「画面变了但解释不出来」要跟对方回合一样计数。
+
+    早先这里既不计数也不暂停（与 `_step_opponent_turn` 三振机制不对称）：
+    模型已经追不上画面了还照旧点击，下一步点击就打在错误的格子上。
+    """
+    provider = _Provider(_model_board())
+    s = _make_session(State.MY_TURN, provider=provider)
+    for drop in (1, 2, 3):
+        provider.board = _junk_board(drop)
+        s.step()
+    assert s.state is State.PAUSED
+    assert s.message == "看不懂局面变化，已暂停（请检查识别）"
+
+
+def test_思考时异常静止要真的停下来():
+    """`_step_thinking` 不能丢掉 `_check_idle()` 的返回值。
+
+    随后那句 `self.state = State.PLAYING` 会把刚设好的 PAUSED 盖回去 ——
+    面板和日志上写着「轮到我方但局面异常静止，请检查」，实际却在继续点击。
+    """
+    clock = _Clock()
+    s = _make_session(
+        State.THINKING, provider=_Provider(_model_board()), clock=clock
+    )
+    s._idle_since = clock.t - 1000
+
+    s.step()
+
+    assert s.state is State.PAUSED
+    assert s._pending_move is None, "没停下来就会带着这一手去点击"
+    assert "静止" in s.message or "异常" in s.message
+
+
+def test_校验失败重试不会把同一手记两遍():
+    """记谱点放在**确认走成之后**。
+
+    点击可能根本没生效（校验超时 → 回到 MY_TURN 重新决策）。提前在点击那一瞬写记谱，
+    就会把一步没走成的着法留在记谱里；重试成功后再写一次，同一回合就出现两手，
+    ICCS 行也成了非法着法序列。`GameRecorder` 没有回滚接口，所以只能等确认。
+    """
+    clock = _Clock()
+    provider = _Provider(_model_board())
+    rec = _recorder()
+    s = _make_session(State.MY_TURN, provider=provider, clock=clock, recorder=rec)
+
+    _run_until(s, State.VERIFY)
+    assert rec.moves == [], "还没确认走成就不该记谱"
+
+    clock.advance(VERIFY_TIMEOUT_S + 0.1)  # 画面一直没变 → 超时
+    s.step()
+    assert s.state is State.PAUSED
+    assert rec.moves == [], "没走成的一手绝不能进记谱"
+
+    s.resume()
+    _run_until(s, State.VERIFY)
+    landed = s._board_before.copy()
+    make(landed, s._pending_move)
+    provider.board = landed
+    s.step()
+
+    assert s.state is State.OPPONENT_TURN
+    assert [m.iccs for m in rec.moves] == ["h2e2"], "重试成功后同一手只该记一次"

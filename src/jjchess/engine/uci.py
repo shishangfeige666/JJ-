@@ -168,7 +168,14 @@ class UciEngine:
         self._proc = proc
         self._reader = threading.Thread(target=self._pump, args=(proc, self._lines), daemon=True)
         self._reader.start()
-        self._handshake()
+        try:
+            self._handshake()
+        except EngineError:
+            # 握手失败（超时、引擎不认 uci）时 `proc` 已经在跑了，不回收就是泄漏一个
+            # 按默认值吃 8 线程、512MB 置换表的皮卡鱼；更糟的是 `self._proc` 还指着它，
+            # 下一次 `analyse()` 会往一个没握过手的进程写命令。
+            self.quit()
+            raise
 
     @staticmethod
     def _pump(proc: subprocess.Popen, sink: queue.Queue) -> None:
@@ -205,10 +212,14 @@ class UciEngine:
                 pass
 
     def restart(self) -> None:
-        """重开引擎。连续重启超过 `MAX_RESTARTS` 次则抛 `EngineError`。"""
-        self.restarts += 1
-        if self.restarts > MAX_RESTARTS:
+        """重开引擎。**连续**重启超过 `MAX_RESTARTS` 次则抛 `EngineError`。
+
+        先判额度再自增：反过来的话放弃之后每 `analyse()` 一次计数还涨一次，
+        引擎彻底坏掉的长局里这个数会一路涨到天上（无害但没意义）。
+        """
+        if self.restarts >= MAX_RESTARTS:
             raise EngineError(f"皮卡鱼连续崩溃 {MAX_RESTARTS} 次，已放弃")
+        self.restarts += 1
         self.quit()
         self._start()
 
@@ -265,18 +276,41 @@ class UciEngine:
         """求一步棋。
 
         局面被引擎拒绝或进程崩掉时，重启一次再试；仍然失败就返回
-        `bestmove == ""` 的空结果（不抛异常，让上层跳过这一帧）。
+        `bestmove == ""` 的空结果（**不抛异常**，让上层跳过这一帧）。
+
+        `EngineError` 绝不能穿出这里：`session._step_thinking` 没有 try，
+        `main._play` 的异常网也只兜 `WindowNotFound`/`KeyboardInterrupt` ——
+        一次「皮卡鱼拒绝该局面」就会把整个脚本连人带记谱一起崩掉。
         """
         try:
-            return self._analyse_once(fen, movetime_ms)
+            result = self._analyse_once(fen, movetime_ms)
         except EngineError:
-            pass
+            result = None
+        if result is not None:
+            # 成功一次就把计数清零：`restarts` 数的是**连续**崩溃（见 `restart` 的
+            # docstring 与 `MAX_RESTARTS` 的注释）。早先它只增不减，而每个被拒绝的
+            # 局面要走「重启一次再试」多花一次额度 —— 真机上交替跑「非法局面 + 正常
+            # 局面」两轮就能在分析**合法**开局时抛「连续崩溃 3 次」，整局记谱丢失。
+            self.restarts = 0
+            return result
 
-        self.restart()
         try:
-            return self._analyse_once(fen, movetime_ms)
+            self.restart()
         except EngineError:
+            # 连重开都开不起来了（exe 被删、握手超时）。再试也是白搭，
+            # 但契约是不抛给调用方，所以收干净进程、返回空结果。
+            self.quit()
             return Analysis()
+
+        try:
+            result = self._analyse_once(fen, movetime_ms)
+        except EngineError:
+            # 重试仍失败：此时 `_proc` 多半已经半死或退出，不收干净的话下一次
+            # `analyse()` 会往这个死进程写命令、白烧一次重启额度。
+            self.quit()
+            return Analysis()
+        self.restarts = 0
+        return result
 
     def _analyse_once(self, fen: str, movetime_ms: int) -> Analysis:
         self._send(f"position fen {fen}")

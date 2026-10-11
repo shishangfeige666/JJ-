@@ -38,6 +38,7 @@ from __future__ import annotations
 import ctypes
 import math
 import random
+import sys
 import time
 from ctypes import wintypes
 
@@ -121,6 +122,24 @@ def _check_coords(x: float, y: float) -> tuple[float, float]:
     return x, y
 
 
+def _check_on_screen(x: float, y: float) -> None:
+    """坐标必须落在虚拟桌面里。
+
+    `SetCursorPos` 越界**不会失败** —— 它把光标钳到虚拟桌面边缘然后返回 TRUE
+    （本机实测 `SetCursorPos(99999, 99999)` 落点 `(-1, 2280)`，`GetLastError()` 是 0）。
+    于是几何一旦算错（手工标定缩放、过期的几何、窗口被拖走），脚本照样"点成功"、
+    照样记进 `mouse.clicks`，下一帧局面校验才失败 —— 现场表现是"点了没反应"。
+    在**发出去之前**拦下来，报错信息才指得准。
+    """
+    left, top, width, height = virtual_desktop_rect()
+    if not (left <= x < left + width and top <= y < top + height):
+        raise ValueError(
+            f"点击坐标 ({x:.0f}, {y:.0f}) 落在虚拟桌面 "
+            f"[{left}, {top}, {left + width}, {top + height}] 之外 —— "
+            "多半是棋盘几何算错了（窗口挪过位置，或手工标定的几何过期）。"
+        )
+
+
 class Mouse:
     """拟人化鼠标。
 
@@ -150,6 +169,7 @@ class Mouse:
         x, y = _check_coords(x, y)
         if self.dry_run:
             return
+        _check_on_screen(x, y)
         ix, iy = round(x), round(y)
         if not _set_cursor_pos(ix, iy):
             raise OSError(f"SetCursorPos({ix}, {iy}) 失败：{ctypes.get_last_error()}")
@@ -170,17 +190,29 @@ class Mouse:
             return
 
         self.move_to(x, y)
-        if _send_mouse_input(True) != 1:
-            raise OSError(
-                "SendInput 发送左键按下失败 —— 通常是本进程完整性级别低于游戏窗口（UIPI 拦截）。"
-                "跑 `uv run python tools/check_capture.py` 看完整性级别，修复见 README「运行前提」。"
-            )
-        time.sleep(random.uniform(*PRESS_HOLD_S))
-        # 抬起**必须**发出去，否则系统里左键一直停在按下状态，用户之后随便动一下鼠标
-        # 就会变成拖拽。所以这里无论成败都要尝试一次，失败了再抛。
-        released = _send_mouse_input(False)
-        if released != 1:
-            raise OSError("SendInput 发送左键抬起失败（同上：多半是 UIPI 拦截）。")
+        # 按下之后**无论怎么退出**都要补一次抬起，否则系统里左键一直停在按下状态，
+        # 用户之后随便动一下鼠标就变成拖拽（而且多半拖在微信窗口上）。
+        # 中间那个 60~140ms 的停顿就是 `Ctrl+C` 最可能落进来的窗口 —— 本脚本是长跑的
+        # 循环程序，Ctrl+C 是常规退出方式。
+        pressed = False
+        try:
+            if _send_mouse_input(True) != 1:
+                raise OSError(
+                    "SendInput 发送左键按下失败 —— 通常是本进程完整性级别低于游戏窗口"
+                    "（UIPI 拦截）。跑 `uv run python tools/check_capture.py` 看完整性级别，"
+                    "修复见 README「运行前提」。"
+                )
+            pressed = True
+            time.sleep(random.uniform(*PRESS_HOLD_S))
+        finally:
+            if pressed and _send_mouse_input(False) != 1:
+                # 这里故意不抛：抛出会盖掉真正的原因（多半是上面的 OSError 或
+                # KeyboardInterrupt）。左键卡住是"已经发生的事"，报出来更有用。
+                print(
+                    "警告：SendInput 发送左键抬起失败，鼠标左键可能停在按下状态 —— "
+                    "按一下左键即可复位。",
+                    file=sys.stderr,
+                )
 
     # ---- 走子 ----
 

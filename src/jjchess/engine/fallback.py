@@ -126,7 +126,10 @@ class FallbackEngine:
         if status == "CHECKMATE":
             return -_MATE + ply
         if status == "STALEMATE":
-            return 0
+            # 象棋里「困毙」（无着可走但没被将军）是**判负**，不是和棋 ——
+            # 中国象棋规则与围棋/国际象棋不同。早先这里返回 0，兜底引擎在劣势时
+            # 会主动把「被对方困毙」当成守和着一个 0 分的着法，能困毙对手时也认不出赢棋。
+            return -_MATE + ply
         if depth <= 0:
             self._nodes += 1
             return self._evaluate(board)

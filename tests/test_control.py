@@ -162,6 +162,50 @@ def test_click_client按客户区原点换算(fake):
     assert m.clicks == [(-1340.0, -79.0)]
 
 
+def test_按下之后被打断也要把左键抬起来(fake):
+    """按下与抬起之间抛异常时，左键**必须**还抬得起来。
+
+    少了 try/finally，系统里左键会一直停在按下状态 —— 用户之后随便动一下鼠标就变成
+    拖拽。`Ctrl+C` 是本脚本的常规退出方式（循环程序），它正好落在那个 60~140ms 的
+    停顿窗口里。
+    """
+    inp, clock = fake
+
+    def _interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    clock.sleep = _interrupt  # type: ignore[method-assign]
+    m = Mouse(dry_run=False, jitter_px=0)
+    with pytest.raises(KeyboardInterrupt):
+        m.click_screen(300.0, 400.0)
+    assert inp.buttons == ["按下", "抬起"], "按下之后无论怎么退出，都要补一次抬起"
+
+
+@pytest.mark.parametrize("xy", [(50.0, 99999.0), (-99999.0, 0.0), (0.0, -99999.0)])
+def test_点到虚拟桌面外面要报错而不是交给系统钳位(fake, monkeypatch, xy):
+    """`SetCursorPos` 越界会**静默钳到虚拟桌面边缘并返回 TRUE**（本机实测：
+    `SetCursorPos(99999, 99999)` 落点 `(-1, 2280)`，`GetLastError()` 是 0）。
+
+    于是几何一旦错了，脚本照样"点成功"、照样记进 `mouse.clicks`，然后下一帧局面校验
+    失败 —— 现场表现是"点了没反应"，极难排查。所以越界要在**发出去之前**就拦下来。
+    """
+    inp, _ = fake
+    monkeypatch.setattr(control, "virtual_desktop_rect", lambda: (0, 0, 1920, 1080))
+    m = Mouse(dry_run=False, jitter_px=0)
+    with pytest.raises(ValueError) as excinfo:
+        m.click_screen(*xy)
+    assert "虚拟桌面" in str(excinfo.value)
+    assert inp.moves == [], "越界的坐标不该真的发给 SetCursorPos"
+
+
+def test_虚拟桌面内的坐标正常放行(fake, monkeypatch):
+    inp, _ = fake
+    monkeypatch.setattr(control, "virtual_desktop_rect", lambda: (-1440, -279, 4000, 2560))
+    m = Mouse(dry_run=False, jitter_px=0)
+    m.click_screen(-1400.0, -270.0)
+    assert inp.moves == [(-1400, -270)]
+
+
 def test_映射与boardgeometry一致():
     """`play_move` 的换算必须和 `ScreenMapper` + `cell_to_px` 完全一致 ——
     这里用同一套 API 复算一遍，防止以后有人"优化"成手写算术时改错方向。"""

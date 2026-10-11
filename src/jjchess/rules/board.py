@@ -78,6 +78,9 @@ _EMPTY_CHARS = frozenset("0.")
 
 _BOARD_ROWS = 10
 _BOARD_COLS = 9
+#: 九宫的纵线范围（两边一样：d 路到 f 路，也就是 file 3~5）。
+_PALACE_MIN = 3
+_PALACE_MAX = 5
 #: XQ-FEN 缺省的后四段（走子方缺省为红方）。
 _DEFAULT_TAIL = ("w", "-", "-", "0", "1")
 
@@ -186,6 +189,34 @@ class Board:
     def copy(self) -> Board:
         """深拷贝一份局面（`grid` 是独立数组）。"""
         return Board(grid=self.grid.copy(), side=self.side)
+
+    def is_legal_position(self) -> bool:
+        """这个局面在象棋规则下可能是真的吗？
+
+        `from_fen` 只挡「棋盘尺寸不对 / 缺将帅」，别的都放行 —— 识别层需要这份容错
+        （坏帧得能被表示出来，不然 `interpret` 无从解释）。但**将帅照面、将帅摆出九宫**
+        这种局面喂给皮卡鱼，它会判 `CRITICAL ERROR` 并直接退出，白白烧掉一次重启额度。
+        所以在送引擎 / 采纳成模型之前先用这个过一道。
+
+        只做**纯棋盘**检查（九宫范围 + 照面），不判将军 —— 后者要用 `moves` 里的
+        攻击生成，而 `moves` 反过来 import 本模块，这里 import 会成环。
+        """
+        red = np.argwhere(self.grid == K)
+        black = np.argwhere(self.grid == -K)
+        if len(red) != 1 or len(black) != 1:
+            return False
+        red_rank, red_file = int(red[0][0]), int(red[0][1])
+        black_rank, black_file = int(black[0][0]), int(black[0][1])
+        # 红帅九宫：rank 0~2 / file 3~5；黑将九宫：rank 7~9 / file 3~5。
+        if not (0 <= red_rank <= 2 and _PALACE_MIN <= red_file <= _PALACE_MAX):
+            return False
+        if not (7 <= black_rank <= 9 and _PALACE_MIN <= black_file <= _PALACE_MAX):
+            return False
+        # 照面：同一纵线且中间一个子都没有。
+        facing = red_file == black_file and not self.grid[
+            red_rank + 1 : black_rank, red_file
+        ].any()
+        return not facing
 
     # ---- 单点访问 ----
 
