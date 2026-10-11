@@ -146,6 +146,49 @@ def probe(hwnd: int, label: str, w: int = PROBE_W, h: int = PROBE_H) -> tuple[bo
     return bool(ok), err, mean
 
 
+# ---- SendInput 自检 ----
+# 和 PrintWindow 一样，SendInput 也受 UIPI 限制：Low 完整性进程往 Medium 窗口注入鼠标事件
+# 会被拦下。这里发一个**零位移的 MOUSEEVENTF_MOVE**（等价于没动），既能证明 SendInput
+# 没被拦，又不会碰到屏幕上的任何东西 —— 绝不用真实左键点击做自检。
+_INPUT_MOUSE = 0
+_MOUSEEVENTF_MOVE = 0x0001
+
+
+class _MouseInput(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),  # ULONG_PTR：x64 下必须 8 字节
+    )
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = (("mi", _MouseInput),)
+
+
+class _Input(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = (("type", wintypes.DWORD), ("u", _InputUnion))
+
+
+def probe_sendinput() -> tuple[bool, int, int]:
+    """发一个零位移鼠标移动。返回 `(是否成功, 插入事件数, GetLastError)`。"""
+    event = _Input()
+    event.type = _INPUT_MOUSE
+    event.mi.dx = 0
+    event.mi.dy = 0
+    event.mi.mouseData = 0
+    event.mi.dwFlags = _MOUSEEVENTF_MOVE
+    event.mi.time = 0
+    event.mi.dwExtraInfo = None
+    ctypes.set_last_error(0)
+    count = int(u.SendInput(1, ctypes.byref(event), ctypes.sizeof(_Input)))
+    return count == 1, count, ctypes.get_last_error()
+
+
 def main() -> int:
     print(f"Python {sys.version.split()[0]}  {ctypes.sizeof(ctypes.c_void_p) * 8} 位")
 
@@ -155,6 +198,12 @@ def main() -> int:
     else:
         name = _INTEGRITY_NAMES.get(rid, "未知")
         print(f"完整性级别：{name}（RID=0x{rid:04X}）")
+
+    sent_ok, sent_count, sent_err = probe_sendinput()
+    if sent_ok:
+        print("SendInput：正常（零位移鼠标移动已送达）")
+    else:
+        print(f"SendInput：失败（插入 {sent_count} 个事件，GetLastError={sent_err}）")
 
     targets: list[tuple[int, str]] = []
     if len(sys.argv) > 1:
@@ -186,8 +235,17 @@ def main() -> int:
         return 1
 
     hwnd, ok, err, mean = game_hwnd
+    if not sent_ok:
+        print(
+            "✗ SendInput 被拦截 —— 脚本能看见棋盘但点不动。这同样是 Low 完整性级别造成的：\n"
+            '      icacls "<项目目录>" /setintegritylevel Medium\n'
+            "  然后重开终端再跑一遍本脚本。"
+        )
+        return 1
+
     if ok and mean > 1.0:
         print(f"✓ 抓图正常：{TARGET_TITLE} 窗口 hwnd={hwnd}，平均亮度 {mean:.2f}（有真实画面）。")
+        print("✓ 鼠标注入正常。抓图与点击两条链路都通了。")
         return 0
 
     print(f"✗ 抓图失败：{TARGET_TITLE} 窗口 hwnd={hwnd}，ok={ok} err={err} 平均亮度={mean:.2f}。")

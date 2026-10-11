@@ -55,9 +55,20 @@ icacls "<项目目录>" /setintegritylevel Medium
 uv run python tools/check_capture.py
 ```
 
-它会打印本进程的完整性级别，并对每个可见窗口实测一次 `PrintWindow(flag=2)`。
-正常输出结尾是 `✓ 抓图正常：JJ象棋 窗口 hwnd=…`；如果几乎所有窗口都 `ok=0 err=5`
-（`ERROR_ACCESS_DENIED`），就是进程还在 Low 级别——重跑上面的 `icacls` 即可。
+它会打印本进程的完整性级别、实测一次 `SendInput`，再对每个可见窗口实测一次
+`PrintWindow(flag=2)`。正常输出结尾是：
+
+```
+✓ 抓图正常：JJ象棋 窗口 hwnd=…，平均亮度 …（有真实画面）。
+✓ 鼠标注入正常。抓图与点击两条链路都通了。
+```
+
+如果几乎所有窗口都 `ok=0 err=5`（`ERROR_ACCESS_DENIED`），就是进程还在 Low 级别——
+重跑上面的 `icacls` 即可。如果只有 `SendInput：失败`，原因相同：Low 完整性进程
+往 Medium 窗口注入鼠标事件会被 UIPI 拦下，症状是「脚本看得见棋盘却点不动」。
+
+`SendInput` 的自检发的是一个**零位移鼠标移动**（等价于没动），不会碰到屏幕上的任何东西；
+本工具绝不用真实左键点击做自检。
 
 `tools/check_capture.py` 刻意只用 `ctypes` + `struct`、不 import `jjchess`、不依赖
 numpy，所以在依赖装坏或换别的 Python 版本时也能跑，能把「环境问题」和「代码问题」
