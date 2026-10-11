@@ -544,8 +544,13 @@ default = true
 | `test_geometry.py` | `cell_to_px` / `px_to_cell` 互逆；越界拒绝 |
 | `test_vision.py` | fixture 帧（开局 + 中局若干）识别 100%；含"选中高亮"帧的鲁棒性 |
 | `test_uci.py` | `skipif(not engine_present)`；已知杀局断言 bestmove；断言非法 FEN 时 wrapper 不崩溃（重启引擎） |
-| `test_session.py` | 合法着法解释器：构造"单格误识别"输入，断言被正确纠正；构造"无法解释"输入，断言进入告警 |
-| `test_record.py` | `GameRecorder` 逐步累积后 `to_text()` 断言着法/记谱/ICCS 行完全一致；`--human-delay` 区间解析（`"0.5-2.0"` / 裸开关 / 非法串拒绝）；可中断睡眠在暂停标志置位后提前返回 |
+| `test_session.py` | 合法着法解释器：构造"单格误识别"输入，断言被正确纠正；构造"无法解释"输入，断言进入告警。**可中断睡眠**：暂停标志置位后提前返回。**终局判定**：轮到我方时长期静止 → `PAUSED` 而非 `GAME_OVER`。**全白帧不改变已确认局面** |
+| `test_config.py` | `Config` 覆盖优先级；`parse_human_delay` 区间解析（裸开关 / `"0.5-2.0"` / 非法串拒绝） |
+| `test_record.py` | `GameRecorder` 逐步累积后 `to_text()` 断言着法/记谱/ICCS 行完全一致；中文记谱与 UTF-8 落盘 |
+| `test_locator.py` | 大厅帧（无棋盘）必须抛 `BoardNotFound`；合成网格图能定位；等距拟合能剔除异常峰 |
+| `test_window.py` | 找不到窗口抛中文 `WindowNotFound`；`is_blank_frame` 对纯白/纯黑为真、对真实画面为假 |
+| `test_control.py` | `dry_run` 不真点；抖动落在范围内；ICCS→屏幕坐标换算正确（易错点） |
+| `test_panel.py` | 合成图尺寸固定；有帧/无帧都不崩；热键边沿去重 |
 | 端到端 | `--dry-run` + 录制帧序列，跑完整管线不断言点击 |
 
 ---
