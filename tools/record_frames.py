@@ -24,7 +24,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from jjchess.window import GameWindow, WindowNotFound, find_window  # noqa: E402
+from jjchess.window import GameWindow, WindowNotFound, find_window
 
 DEFAULT_OUT = Path("tests/fixtures")
 WATCH_INTERVAL = 0.5
