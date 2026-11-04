@@ -1,12 +1,23 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+# pytest 的临时目录。正常情况下它开在系统 TEMP 下，但 `TMP` 被指成相对路径时
+# 会落到仓库根目录，一次 `git add -A` 就会把测试临时文件提交进去（真发生过）。
+pytest-of-*/
 # 运行时生成物（由 tools/calibrate.py 产出）
 config/calibration.json
 config/templates.npz
+config/templates_preview.png
+config/recognition_preview.png
 # 引擎二进制（由 tools/fetch_pikafish.py 下载）
 vendor/
 # 调试截图
 debug/
+# 对局记录（中文记谱导出）
+records/
+# 临时探针脚本与日志
+_probe/
+# tools/record_frames.py --watch 的滚动产物（挑出有用的再改名提交）
+tests/fixtures/mid_*.png

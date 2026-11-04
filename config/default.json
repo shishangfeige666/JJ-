@@ -1,0 +1,23 @@
+{
+  "engine": {
+    "path": "vendor/pikafish/pikafish.exe",
+    "nnue": "vendor/pikafish/pikafish.nnue",
+    "movetime_ms": 1200,
+    "threads": 8,
+    "hash_mb": 512
+  },
+  "vision": {
+    "conf_min": 0.60,
+    "conf_good": 0.75
+  },
+  "session": {
+    "tolerance_cells": 1,
+    "opponent_idle_sec": 0.0,
+    "human_delay": {
+      "enabled": false,
+      "min_s": 0.5,
+      "max_s": 2.0
+    }
+  },
+  "record": true
+}

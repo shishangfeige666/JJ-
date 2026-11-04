@@ -167,12 +167,13 @@ class BoardGeometry:
 
 ### 4.4 `src/jjchess/vision/templates.py` + `recognizer.py` —— 棋子识别
 
-**棋类集合（15 类）**：`K帅/将 A仕/士 E相/象 H马 R车 C炮 P兵/卒` × `{r红, b黑}` + `empty` 空点 = 15。
+**棋类集合（15 类）**：`K帅/将 A仕/士 B相/象 N马 R车 C炮 P兵/卒` × `{r红, b黑}` + `.` 空点 = 15。
+（用 FEN 标准字符 `B`/`N`，`E`/`H` 只作为 `PIECE_CHAR_ALIASES` 里的输入别名保留。）
 
 **模板获取**（`tools/calibrate.py`，一次性）：
 
 1. 让用户把游戏停在**开局标准局面**（或脚本自动检测到开局局面）
-2. 按已知初始布局，在每个交叉点切 ROI，得到 14 类模板（同类多格 → 取像素中位数，抗噪）
+2. 按已知初始布局，在每个交叉点切 ROI，得到 14 类模板（同类多格 → 取**得分最高**的那一格，不是中位数）
 3. 从未被占据的交叉点切 `empty` 模板（取多格中位数——棋盘木纹均匀，交叉点形态一致）
 4. 落盘 `config/templates.npz`（键：类名 → `(72,72,3) uint8`）
 
@@ -186,9 +187,22 @@ ROI 边长 = round(1.30 * cell_px)   # 略大于圆盘，含少量木纹背景
 → argmax
 ```
 
-**两阶段剪枝**：先只和 `empty` 模板比，相关性 > 0.9 ⇒ 直接判空；否则再和 14 类比。既快又避免把空点误判成棋子。
+**判空用拉普拉斯方差，不是空模板相关**（原方案已实测证伪）：
+先算这一格的拉普拉斯方差 `lap`，`lap < EMPTY_LAPLACIAN = 3000` 就判空
+（`conf = 1/(1+(lap/EMPTY_LAPLACIAN)**2)`），否则再和 14 类棋子比。
+实测空点 250~1149、棋子 8809~18627，差 7.7 倍；而「空点 vs 空模板」的相关性本身只有 0.65，
+分数散落在 0.046~0.926，根本分不开。
 
-**置信度与兜底**：`conf < 0.75` 标 `unknown`，置信度矩阵 `(10,9)` 一并返回；面板上按 绿(>0.9)/黄(0.75~0.9)/红(<0.75) 着色标注。
+**匹配窗口要缩到核心**：`MATCH_CORE_CELLS = 0.85`（只取中心 85% 做相关）。
+棋子选中时的**光圈**正好落在 ROI 外圈，全尺寸匹配会被它严重干扰 ——
+真机上量到「黑砲」那格 `top1 = 0.722 / top2 = 0.686`（只差 0.036，随时翻车），
+缩到 0.85 后变成 `0.839 / 0.693`；两个 fixture 的分类正确率都是 1.000。
+（缩到 0.95 差距掉回 0.103，1.05 以上光圈又进得来，所以取 0.85。）
+
+**置信度与兜底**：`conf < 0.60` 标 `unknown`，置信度矩阵 `(10,9)` 一并返回；
+面板上按 绿(>0.75)/黄(0.60~0.75)/红(<0.60) 着色标注。
+阈值从最初的 0.75/0.90 下调，是因为实测棋子 top1 最低 0.798、空点 conf 最低 0.872，
+原阈值会把每一格都标成不可信。
 
 ```python
 @dataclass
@@ -299,6 +313,8 @@ IDLE ──发现开局局面──▶ MY_TURN ──思考──▶ THINKING �
 
 **我方执色判定**：`--side red|black|auto`（默认 `auto`）。`auto` = 开局局面下看屏幕**最下一行（row=9）**的中宫位是红帅还是黑将 → 决定执色；同时决定是否上下翻转映射。
 
+**连下多局时每局都要重判执色**（真机反馈）：小程序每一局都可能换边（上一局执红、下一局执黑），而执色绑在三处 —— `ScreenMapper`、`Mouse.play_move` 的坐标换算、`GameRecorder` 的「我方执色」—— 任何一处还留着上一局的，整块棋盘就会被认反（180°）。所以 `_adopt_side(args, window, geom, my_side)` 在 `_next_round()` 之后、`new_round()` 之前重新判一次，变了就同时换 `mapper` / `mouse.my_side` / `my_side`（`recorder` 本来就每局重建）。判据仍是 `_bottom_row_ink()`，但要求最下一行**至少 `SIDE_MIN_INK_CELLS = 3` 格看得出字迹**才敢下结论 —— 刚点完「再来一局」的头几帧棋盘上还什么都没有，那时 `detect_side` 会给出「一片空白 → 默认红」这个默认值。等不到字迹（`SIDE_REDETECT_WAIT_S = 6.0` 秒）就沿用上一局的执色，绝不凭空白猜。`--side red/black` 是用户钉死的，永不重判。
+
 **对手走子检测 + 合法着法解释器**（消除识别噪声的关键设计）：
 
 ```
@@ -321,7 +337,9 @@ cur  = 本帧识别结果
 
 **我方走子校验**：点击后等待画面稳定（连续 2 帧相同），比对是否 ≈ `make(prev, my_move)`；不符 → 重试 1 次 → 仍不符则 `PAUSED`。
 
-**终局检测**：局面连续 12 秒不变 且 非我方回合，或检测到底部弹出按钮区域亮度突增 → 判定对局结束，停止并打印对局记录。
+**终局检测**（设计稿原文，**已被真机推翻并改掉**）：原写「局面连续 12 秒不变 且 非我方回合，或检测到底部弹出按钮区域亮度突增」。真机实测 JJ象棋陪练单步能想两分钟以上，**棋盘没动推不出对局结束** —— 现在只认一个信号：棋盘从画面上消失超过 `BOARD_LOST_TIMEOUT_S = 10.0` 秒。想看门狗就把 `session.opponent_idle_sec` 设成秒数，超时**只暂停**，绝不判终局。
+
+**连下多局**：终局之后不退出，而是等结算画面出现 —— 判据是底部那条带的颜色（`is_result_screen()`：绿通道 ≥ 140 且绿减蓝 ≥ 60；真机实测结算画面 G=185.0/B=94.9，对局中同一处 G=82.4/B=70.6）—— 认出之后按客户区比例点 `(0.502, 0.910)` 处的「再来一局」，再等新棋盘出现（`locate()` 成功）就开下一局。**认不出就不点**：同一位置在对局中是棋盘，盲点等于自己乱走一步，这时打印提示并收工。`--rounds N` 限定局数（`0` = 一直下），每局各写一份记谱。
 
 ### 4.9 `src/jjchess/record.py` —— 对局记录与中文记谱导出
 
@@ -390,7 +408,7 @@ ICCS: h2e2 h9g7 h0g2
 ```
 uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
-               [--human-delay [MIN-MAX]] [--no-record]
+               [--human-delay [MIN-MAX]] [--no-record] [--rounds N]
 ```
 
 主循环：`grab → locate(首帧) → recognize → session.step → panel.render → hotkeys` 循环，目标 4~6 FPS。
@@ -462,14 +480,23 @@ rank = row
 
 ```json
 {
-  "window":  { "title_substr": "JJ象棋", "capture_method": "printwindow" },
-  "board":   { "roi_y_frac": [0.15, 0.80], "edge_thresh": 60 },
-  "vision":  { "roi_scale": 1.30, "template_size": 72, "conf_min": 0.75, "conf_good": 0.90 },
-  "engine":  { "path": "vendor/pikafish/pikafish.exe", "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
-  "control": { "jitter_px": 6, "down_up_ms": [60,140], "between_ms": [180,350], "dry_run": false },
-  "session": { "side": "auto", "tolerance_cells": 1, "stable_frames": 2, "endgame_idle_s": 12 }
+  "engine":  { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
+               "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
+  "vision":  { "conf_min": 0.60, "conf_good": 0.75 },
+  "session": { "tolerance_cells": 1, "opponent_idle_sec": 0.0,
+               "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
+  "record":  true
 }
 ```
+
+没有出现在这里、只作为模块常量的：窗口标题 `WINDOW_TITLE = "JJ象棋"`（`src/jjchess/main.py`）、
+棋盘 ROI 比例 `ROI_TOP/ROI_BOTTOM = 0.15/0.80`、`ROI_LEFT/ROI_RIGHT = 0.01/0.99`、
+识别尺度 `ROI_SCALE = 1.30` / `SEARCH_SCALE = 1.90` / `TEMPLATE_PX = 72` / `MATCH_CORE_CELLS = 0.85` /
+`EMPTY_LAPLACIAN = 3000`（`src/jjchess/vision/templates.py`）、
+走子校验额度 `VERIFY_TIMEOUT_S = 5.0`、棋盘丢失额度 `BOARD_LOST_TIMEOUT_S = 10.0`（`src/jjchess/session.py`）、
+画面稳定闸门 `SETTLE_SEC = 0.50`、定期复查棋盘 `RELOCATE_EVERY_S = 2.0`（`src/jjchess/main.py`）。
+这些没做成配置项，是因为它们要么是「跟游戏画面绑定、换游戏才改」的量，
+要么是调参时反复量过、写死并配了注释与测试比暴露给用户更安全。
 
 `config/calibration.json` 与 `config/templates.npz` 为**运行时生成**，不入库，由 `tools/calibrate.py` 产出。
 
@@ -559,15 +586,20 @@ default = true
 
 | 风险 | 对策 |
 |---|---|
-| Chromium 窗口 `PrintWindow` 偶发返回空白帧 | 全白检测 → 退避重试 → 连续 5 次失败自动切 BitBlt 屏幕法 |
-| 窗口被拖动 / 小程序尺寸变化 | 每帧校验 hwnd 与客户区尺寸；变化则重新定位棋盘 |
-| 棋子选中高亮、走子动画导致误识别 | 只取盘心区 + CLAHE 归一化；动画期等待画面稳定（连续 2 帧一致）才识别 |
-| 单格识别错误导致非法局面 | 合法着法解释器自动纠正；送引擎前 `sanity_check` |
+| Chromium 窗口 `PrintWindow` 偶发返回空白帧 | `is_blank_frame` + `is_torn_frame` 双检（撕裂帧的暗像素比达 0.2993），坏帧跳过重抓 `GRAB_ATTEMPTS = 3` 次；仍失败计入 `bad_streak`，连续 `MAX_BAD_STREAK = 10` 次退出 |
+| 窗口被拖动 / 小程序尺寸变化 | 每帧校验 hwnd 与客户区尺寸；变化则重新定位棋盘。另加每 `RELOCATE_EVERY_S = 2.0` 秒定期复查（`locate()` 实测 10.9~12.7 ms，代价可忽略），定位失败就当作棋盘已消失。**注意：复查只做「还在不在」，不换几何** —— `locate()` 自己每次抖 ±1.5 像素，每 2 秒换一次等于让采样窗口一直晃，反而把临界格晃出更多 `unknown`（真机实测：会换的那版跑一分钟就撞上「点击后局面校验失败」，不换的那版三分钟里一次没撞） |
+| 棋盘几何偏几像素导致脚本静默卡死 | 几何只在开局/换局时定位一次，而换局那一下画面正在过渡，拟合可能偏 6 像素（实测 `origin y 602.69`，正常 `609.1`）。偏一点点平时没事，但有子走到红方底线那排时该格置信度掉到 **0.37** 被判 `unknown`，而识别层把「认不出」当**空**处理 —— 「画面上多了一个子」在会话眼里变成「什么都没变」，`_grid_diff == 0` 直接早退；`opponent_idle_sec` 默认 0（不许因为局面静止就收摊），脚本就停在那里一动不动十几分钟。对策：只要 `rec.unknown` 非空就拿**这一帧**重新定位一次再认一遍，认干净了就换过去（换之前过一道 `geom_close`：原点差 ≤ `GEOM_CLOSE_PX = 25` 像素且格距差 ≤ `GEOM_CLOSE_CELL_PX = 6` 像素，防止跳到「正在匹配」那块格距 121 的装饰棋盘）；认不干净就原样用，并每 `UNKNOWN_WARN_EVERY_S = 5.0` 秒打一条提醒 |
+| 换局瞬间抓到「缩小的结算棋盘」，下一局拿假几何开局 | 点完「再来一局」只过 100 多毫秒脚本就去抓帧，画面还没切走，抓到的还是结算画面上那块**缩小过的**棋盘（真机 run17 实测 `origin=(242.1958, 380.4661) dx=120.9047 cell_px=102.656`，真棋盘 `(101.5, 609.3) dx=154.6 cell_px=125.85`），而且上面摆着终局局面、**子数一点不少** —— 只数子的 `MIN_PIECES_ON_BOARD` 拦不住，于是第二局拿着假几何开了局、接着卡在 IDLE 里等一个永远等不到的开局。对策：`_new_board_geom(frame, prev_geom)` 三道闸门 —— 结算画面不算棋盘（`is_result_screen`）、盘上得有子（`count_pieces`）、新棋盘得和上一局「差不多在同一个地方」（`geom_close`）。`_play` 里用 `last_geom` 记住最近一次确认过的几何（`geom` 会在棋盘消失时被清掉，换局那一刻正需要它） |
+| 结算画面把终局棋盘留在屏幕上 | 练习局（「JJ象棋陪练」）的结算画面**棋盘还留在屏幕上**，显示的是终局局面，定位得到、双方将帅也都认得出，看起来就是一盘正在下的棋 —— 会话拿它去和「我方这步之后的预期」比，5 秒后误报「点击后局面校验失败，已暂停」，而棋其实早下完了（真机 run16 我方绝杀赢了）。对策：`is_result_screen(img)` 命中就当作棋盘已消失（走 `BoardNotFound` → `GAME_OVER` 那条老路），接着照常点「再来一局」；启动时若正停在结算画面，先点「再来一局」再等棋盘 |
+| 连下多局时小程序换边（这一局执红、下一局执黑） | 执色只在启动时判一次，而它绑着 `ScreenMapper`（识别时的屏幕格 ↔ 板坐标映射）、`Mouse.play_move` 的坐标换算、`GameRecorder` 的「我方执色」三处。第二局若换了边，整块棋盘会被认反 180°、点出去的坐标镜像 —— 表现为「替对手走棋」或一直「点击后局面校验失败」。对策：`_adopt_side()` 在每次 `_next_round()` 之后重判一次，变了就一起换 `mapper` / `mouse.my_side` / `my_side`；重判要求最下一行至少 3 格看得出字迹（换局头几帧棋盘是空的，`detect_side` 的「空白 → 默认红」会骗人），等不到就沿用上一局的执色。`--side red/black` 钉死不重判 |
+| 棋子选中高亮、走子动画导致误识别 | 只取盘心区 + CLAHE 归一化；动画期等画面稳定（`FrameSettle`，同一 FEN 连续 `SETTLE_SEC = 0.50` 秒）才识别 |
+| 单格识别错误导致非法局面 | 合法着法解释器自动纠正；送引擎前 `sanity_check`。`interpret()` 额外要求**落点精确匹配** —— 一颗子走完一定在落点上，只放宽其余格子，否则容忍度会变成模型漂移的通道（真机踩过） |
 | 皮卡鱼严格校验导致进程自杀 | 先校验后发送；wrapper 检测进程退出并自动重启（最多 3 次）。**已实测确认**：非法 FEN → exit code 1 |
 | 引擎缺少 NNUE 权重无法加载 | `pikafish.nnue`（50.7 MB）与 exe 必须同目录；`fetch_pikafish.py` 安装**两个**文件；自检用 `go depth 10` 确认能出 `bestmove` |
 | UCI 读取时序错误导致只搜到 depth 1 | **发完 `go` 不可立即 `quit`**；必须阻塞读到 `bestmove` 行 |
 | 皮卡鱼下载失败（GitHub 403 / 直连仅 25 KB/s 需 35 分钟） | 优先镜像 `gh-proxy.com`（实测 21.6 MB/s，3 秒完成）；`curl --retry 5 -C -` 断点续传；**sha256 强校验**保证镜像内容与官方一致；失败时降级到浅层 α-β 并在面板标红 |
-| 点击落空 / 被弹窗拦截 | 点击后局面复检；重试 1 次；仍失败熔断为 PAUSED |
+| 点击落空 / 走子动画没放完 | 点击后按**时间**给额度复检（`VERIFY_TIMEOUT_S = 5.0` 秒），不是「重试 1 次」—— 主循环一轮才 20 ms，两次校验只隔 40 ms，连棋子滑过去的动画都没放完。吃子动画实测要 2~3 秒才停稳；仍对不上就熔断为 PAUSED |
+| 对局结束后进程空转、记谱不落盘 | 终局判断放在**主循环开头**（循环体里有 `continue` 的早退分支，放末尾会被绕过去）；`GAME_OVER` 即 `break` 并走 `_finish()` 落盘记谱 |
 | 鼠标被抢占 / 误操作 | `F8` 即时暂停；`--dry-run` 全程不点击 |
 | 窗口顶部 279px 在屏外 | 抓图不受影响（`PW_RENDERFULLCONTENT` 已实测可拿到屏外部分）；启动时校验棋盘是否完全在屏幕内，否则提示移动窗口 |
 

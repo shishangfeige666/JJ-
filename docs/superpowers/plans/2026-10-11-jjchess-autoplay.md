@@ -28,7 +28,7 @@
 - **引擎路径**：`vendor/pikafish/pikafish.exe` 与 `vendor/pikafish/pikafish.nnue`（**两个文件都必须存在**）。
 - **引擎默认参数**：`--movetime 1200 --threads 8 --hash 512`。
 - **引擎交互铁律**：发完 `go` **绝不可立即发 `quit`**；必须阻塞读 stdout 直到出现 `bestmove` 行。非法 FEN 会让引擎 **exit code 1 自杀**，wrapper 必须检测并自动重启（≤3 次）。
-- **视觉常量**：`conf_min = 0.75`、`conf_good = 0.90`、empty 剪枝阈值 `0.9`、ROI 边长 `1.30 * cell_px`、模板 `72×72` 灰度+CLAHE、匹配法 `cv2.TM_CCOEFF_NORMED`。
+- **视觉常量**：`conf_min = 0.60`、`conf_good = 0.75`、判空用**拉普拉斯方差** `EMPTY_LAPLACIAN = 3000`（不是 empty 模板相关，见 Task 12 的 Ruling）、ROI 边长 `1.30 * cell_px`、搜索尺度 `1.90`、模板 `72×72` 灰度+CLAHE、匹配窗口 `MATCH_CORE_CELLS = 0.85`（避开选中光圈）、匹配法 `cv2.TM_CCOEFF_NORMED`。
 - **纠错常量**：`TOLERANCE_CELLS = 1`。
 - **拟人化**：`human_delay` 默认 `{enabled: false, min_s: 0.5, max_s: 2.0}`；延迟必须切成 **≤50ms 片段**轮询暂停标志（保证 S6 可中断）。鼠标落点抖动 ±6px，按下→抬起 `60~140ms`，两点间 `180~350ms`。
 - **git 提交信息前缀**：`feat:` / `test:` / `docs:` / `chore:`。
@@ -40,7 +40,7 @@
 - **RF-1 游戏没开 / 窗口标题变了**：`window.py` 找不到 `JJ象棋` 窗口时，必须抛带中文说明的 `WindowNotFound` 并友好退出，不能抛 `AttributeError` 或退化成死循环。→ Task 8
 - **RF-2 抓图返回全白帧**：窗口最小化或被遮挡时 `PrintWindow` 会返回纯白图。必须能检测出空白帧并重试/降级/告警；**绝不能把全白帧当成"棋盘 32 子全空"** 而去走非法着法。→ Task 8 + Task 15
 - **RF-3 画面里根本没有棋盘**：停在「对战」大厅菜单、或弹出广告时，locator 必须判定失败并等待，不能把菜单纹理当网格线定位出一堆垃圾坐标。→ Task 10
-- **RF-4 局面长时间不变**：对方长考 / 网络卡顿时局面会静止很久。**轮到"我方"时局面不变必须判 PAUSED 告警，不能判 GAME_OVER**；只有「非我方回合 + 超时」或「底部按钮区亮度突增」才可判终局。→ Task 15
+- **RF-4 局面长时间不变**：对方长考 / 网络卡顿时局面会静止很久。**轮到我方时局面不变必须判 PAUSED 告警，不能判 GAME_OVER**；~~只有「非我方回合 + 超时」或「底部按钮区亮度突增」才可判终局~~ —— **后半句已被真机推翻**：对局进行中对方单步能想两分钟以上，「非我方回合 + 超时」也只能**暂停**；终局只认「棋盘从画面消失」。→ Task 15 / Task 19 Ruling
 - **RF-5 窗口被拖动 / 改尺寸 / 换显示器**：已缓存的 `calibration.json` 与 `BoardGeometry` 立即失效。必须每帧校验 hwnd 与客户区尺寸，变化则重新定位，不能继续对着旧坐标点击。→ Task 8 + Task 17
 
 ---
@@ -515,8 +515,8 @@ git -c user.name=dev -c user.email=dev@local commit -m "feat: BoardGeometry 像�
 **Interfaces:**
 - Consumes: 无
 - Produces:
-  - `@dataclass class Config`，字段：`engine_path: Path`、`nnue_path: Path`、`movetime_ms: int`、`threads: int`、`hash_mb: int`、`conf_min: float`、`conf_good: float`、`tolerance_cells: int`、`human_delay: tuple[float,float] | None`、`gameover_idle_sec: float`、`debug_dir: Path | None`、`record: bool`
-  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.75, conf_good=0.90, tolerance_cells=1, human_delay=None, gameover_idle_sec=12.0, record=True`）
+  - `@dataclass class Config`，字段：`engine_path: Path`、`nnue_path: Path`、`movetime_ms: int`、`threads: int`、`hash_mb: int`、`conf_min: float`、`conf_good: float`、`tolerance_cells: int`、`human_delay: tuple[float,float] | None`、`opponent_idle_sec: float`、`debug_dir: Path | None`、`record: bool`
+  - `DEFAULTS: Config`（`movetime_ms=1200, threads=8, hash_mb=512, conf_min=0.60, conf_good=0.75, tolerance_cells=1, human_delay=None, opponent_idle_sec=0.0, record=True`）—— 置信度阈值从 0.75/0.90 下调见 Task 15 的 Ruling
   - `load_config(path: Path | None, overrides: dict) -> Config`
   - `parse_human_delay(arg: str | None) -> tuple[float,float] | None`
 
@@ -559,8 +559,8 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.config'`
 {
   "engine": { "path": "vendor/pikafish/pikafish.exe", "nnue": "vendor/pikafish/pikafish.nnue",
               "movetime_ms": 1200, "threads": 8, "hash_mb": 512 },
-  "vision": { "conf_min": 0.75, "conf_good": 0.90 },
-  "session": { "tolerance_cells": 1, "gameover_idle_sec": 12.0,
+  "vision": { "conf_min": 0.60, "conf_good": 0.75 },
+  "session": { "tolerance_cells": 1, "opponent_idle_sec": 0.0,
                "human_delay": { "enabled": false, "min_s": 0.5, "max_s": 2.0 } },
   "record": true
 }
@@ -1076,7 +1076,7 @@ def test_开局32子全对(opening):
     rec = recognize(img, geom, ts, ScreenMapper(RED))
     assert rec.board.grid.tolist() == expect.grid.tolist()
     assert rec.unknown == []
-    assert rec.confidence.min() > 0.75
+    assert rec.confidence.min() > 0.75   # 实测定在 0.872（MATCH_CORE_CELLS = 0.85）
 
 @pytest.mark.parametrize("name", ["mid_01", "mid_02", "mid_03"])
 def test_中局识别正确(name):
@@ -1118,7 +1118,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.vision.reco
 
 - [ ] **Step 3: 实现 `recognize`**
 
-对屏幕 `(row, col)` 遍历 90 格：`make_patch` → `templates.match` → `CHAR_VALUES[名字]`（`.` 映射为 `0`）；`(rank, file) = mapper.to_board(row, col)`，写进 `board.grid[rank, file]`。置信度写 `confidence[row, col]`；`conf < conf_min(0.75)` 的格子**置为 `0`（空）**并加入 `unknown`。返回的 `board.side` 设为 `side_to_move`。
+对屏幕 `(row, col)` 遍历 90 格：`make_patch` → `templates.match` → `CHAR_VALUES[名字]`（`.` 映射为 `0`）；`(rank, file) = mapper.to_board(row, col)`，写进 `board.grid[rank, file]`。置信度写 `confidence[row, col]`；`conf < conf_min(0.60)` 的格子**置为 `0`（空）**并加入 `unknown`。返回的 `board.side` 设为 `side_to_move`。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1391,12 +1391,12 @@ return None
 - `MY_TURN`：若未 `my_side` 判定过，用首帧 `mapper` 判定（`auto` 模式）。
 - `THINKING`：`analyse(board.to_fen(), cfg.movetime_ms)`；记录 `think_ms`；若有 `human_delay`，用 `interruptible_sleep(random.uniform(*human_delay), lambda: self._pause_requested or self.should_stop)`，被中断则回到 `MY_TURN` 且**不走子**。面板 `message` 设为 `f"THINKING (human delay {d:.1f}s)"`。
 - `PLAYING`：`mouse.play_move(mv, geom_screen)`；随后 `recorder.add(...)`。
-- `VERIFY`：重抓一帧（`board_provider()` 返回 `None` 时按失败处理）→ 与 `make(prev, mv)` 比对；一致 → `OPPONENT_TURN`；不一致 → 重试 1 次，仍不一致 → `PAUSED` 并 `message = "点击后局面校验失败，已暂停"`。
+- `VERIFY`：重抓一帧（`board_provider()` 返回 `None` 时按失败处理）→ 与 `make(prev, mv)` 比对，**落点必须精确匹配**（一颗子走完一定在落点上，只放宽其余格子）；一致 → `OPPONENT_TURN`；不一致 → 在 `VERIFY_TIMEOUT_S = 5.0` 秒内继续等（游戏里棋子是滑过去的，吃子动画实测要 2~3 秒才停稳），超时仍不一致 → `PAUSED` 并 `message = "点击后局面校验失败，已暂停"`。
 - `OPPONENT_TURN`：`cur = board_provider()`；`cur is None`（抓图失败/白帧）→ **直接 return，不改动任何状态**（`[RF-2]`）；`interpret(prev, cur)` 得着法 → 采纳并 `recorder.add` → `MY_TURN`。
   连续 3 次 `interpret` 返回 `None` 且 `cur != prev` → `PAUSED` 并 `message = "无法解释局面变化，已暂停（请检查识别）"`。
 - `IDLE`：`board_provider()` 返回的局面与 `START_FEN` 一致（或棋子数 ≥ 28 且双方将帅在位）→ 判定开局，转 `MY_TURN`。
 - **终局判定**：维护 `self._idle_since`（局面最后一次变化的时刻）。
-  - `state is OPPONENT_TURN` 且 `now - _idle_since > cfg.gameover_idle_sec` → `GAME_OVER`，`message = "局面长时间不变，判定对局结束"`。
+  - （**已被真机推翻，见 Task 19 Ruling「静止≠终局」**）`state is OPPONENT_TURN` 且 `now - _idle_since > cfg.opponent_idle_sec` → 只**暂停**，绝不 `GAME_OVER`；且 `opponent_idle_sec <= 0`（默认）时整项关闭。
   - `state is MY_TURN` 且超时 → **不得进 `GAME_OVER`**；改为 `PAUSED`，`message = "轮到我方但局面异常静止，请检查"`（`[RF-4]`）。
 - `pause()` 置 `_pause_requested`；`step()` 开头若已暂停则立刻 return（保证 `F8` 即时生效）。
 
@@ -1467,7 +1467,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'jjchess.ui'`
 
 - [ ] **Step 3: 实现 `compose` 与 `Panel`**
 
-- 左半：`frame` 缩放到 `(width*0.6, height)`；`geom` 非空时在每个交叉点画识别字符与置信度色框（`>0.9` 绿 / `0.75~0.9` 黄 / `<0.75` 红）；`rec.unknown` 的格子画红叉。
+- 左半：`frame` 缩放到 `(width*0.6, height)`；`geom` 非空时在每个交叉点画识别字符与置信度色框（`>0.75` 绿 / `0.60~0.75` 黄 / `<0.60` 红）；`rec.unknown` 的格子画红叉。
 - 右半：用 `cv2.putText` 逐行输出中文信息（**OpenCV 的 `putText` 不支持中文**，用 `cv2.freetype`？—— 不引入新依赖，改为：中文用 PIL？也不行）。
   **决策**：`cv2.putText` 只画 ASCII。中文信息（执色、状态说明）用 `cv2.putText` 的 ASCII 等价形式输出（如 `SIDE: RED`、`STATE: THINKING`），中文仅出现在**终端日志与导出的记谱文件**里。这样零新依赖，且 panel 的信息在调试场景足够。
 - 底部状态条：`RUNNING / PAUSED / DRY-RUN / GAME OVER` + `session.message`（ASCII 化）。
@@ -1548,8 +1548,46 @@ Expected: FAIL —— `AttributeError: module 'jjchess.main' has no attribute 'b
 uv run jjchess [--side auto|red|black] [--movetime 1200] [--threads 8] [--hash 512]
                [--dry-run] [--no-panel] [--calibrate] [--debug-dir DIR]
                [--human-delay [MIN-MAX]] [--no-record] [--config PATH]
+               [--rounds N]        # 后加：连下几局；0（默认）= 一直下
 ```
 `--human-delay` 用 `nargs="?"`, `const=""`（裸开关传空串，交给 `parse_human_delay` 解释）；`--side` 用 `choices=["auto","red","black"]`。
+
+> **后加的真机修复（连下多局那一轮）**：主循环里多出四个常量，都是真机踩出来的，
+> 不是设计稿里的东西 —— `MIN_PIECES_ON_BOARD = 2`（「正在匹配」页面上那块**空的**装饰棋盘
+> 会被 `locate()` 认出来，格距 102.7 对真棋盘 125.8，所以定位成功之后还得数一数盘上有没有子）、
+> `GEOM_CLOSE_PX = 25.0` / `GEOM_CLOSE_CELL_PX = 6.0`（换几何之前的「还算同一个棋盘」闸门）、
+> `UNKNOWN_WARN_EVERY_S = 5.0`（「有几格认不出来」这条提醒的节流）。
+> 配套函数 `geom_close()` 与 `_retry_unknown()`：只要 `recognize` 报出 `unknown`，
+> 就拿这一帧重新定位一次再认一遍，认干净了就换过去。缘由是真机卡死过十几分钟 ——
+> 换局那一下拟合出的网格纵向偏 6 像素（`origin y 602.69`，正常 `609.1`），
+> 红方底线那格置信度掉到 **0.37** 被判 `unknown`，而识别层把「认不出」当**空**处理，
+> 于是「画面上多了一个子」在会话眼里变成「什么都没变」，`_grid_diff == 0` 直接早退，
+> 而 `opponent_idle_sec` 默认是 0（不许因为局面静止就收摊），脚本就停在那儿一动不动。
+>
+> **再后一轮（第二次真机连下多局）**：`_next_round` 的「等新棋盘」换成 `_new_board_geom(frame, prev_geom)`
+> 三道闸门。真机 run17 实测：点完「再来一局」只过 137ms 就抓帧，画面还没切走，抓到的是
+> **结算画面上那块缩小过的棋盘**（`origin=(242.1958, 380.4661) dx=120.9047 cell_px=102.656`），
+> 它摆着终局局面、子数一点不少，`MIN_PIECES_ON_BOARD` 拦不住 → 第 2 局拿假几何开局 → 卡在 IDLE。
+> 于是加两道：`is_result_screen(frame)` 直接否掉结算画面；新几何得和上一局过 `geom_close`。
+> `_play` 里相应地多一个 `last_geom`（`geom` 在棋盘消失时会被清成 `None`，换局那一刻正需要它）。
+> 同一轮还发现 `test_空的装饰棋盘不算找到棋盘` 是**假测试** —— `NEW_BOARD_WAIT_S` 设成 0.0
+> 时等待循环一次都不进，`assert ... is None` 是「因为没跑」通过的，那条闸门从没被真正验证过。
+> **注意别改成「每次复查就换几何」**：`locate()` 自己每次抖 ±1.5 像素，那样等于让采样
+> 窗口一直晃，真机实测跑一分钟就撞上「点击后局面校验失败」。
+>
+> **第三次真机反馈（用户报告）：「连续不同棋局我方可能执黑也可能执红」。**
+> 执色原先只在启动时判一次（`_wait_for_board`），而它绑着三处 —— `ScreenMapper`
+> （识别时的屏幕格 ↔ 板坐标映射）、`Mouse.play_move` 的坐标换算、`GameRecorder`
+> 的「我方执色」。第二局换了边而不重判，整块棋盘会被认反 180°、点出去的坐标镜像，
+> 表现就是「替对手走棋」或一直「点击后局面校验失败」。对策：
+> `_adopt_side(args, window, geom, my_side)` 在每次 `_next_round()` 之后、`new_round()`
+> 之前重判一次，变了就一起换 `mapper` / `mouse.my_side` / `my_side`（recorder 本来就
+> 每局重建）。判据从 `detect_side` 里拆出的 `_bottom_row_ink()`，并且要求最下一行
+> **至少 `SIDE_MIN_INK_CELLS = 3` 格看得出字迹**才敢下结论 —— 刚点完「再来一局」
+> 的头几帧棋盘上什么都没有，`detect_side` 的「一片空白 → 默认红」会骗人；等不到
+> （`SIDE_REDETECT_WAIT_S = 6.0` 秒）就沿用上一局的执色。`--side red/black` 钉死不重判。
+> 测试桩 `_patch_round_loop` 里要顺手把 `_adopt_side` 也挡掉，否则每条多轮测试都得
+> 白等 6 秒（桩帧是随机噪声，数不出字迹）。
 
 - [ ] **Step 4: 实现主循环**
 
@@ -1664,6 +1702,6 @@ git -c user.name=dev -c user.email=dev@local commit -m "docs: 使用说明与端
 
 **3. 类型一致性**：`Analysis` 在 T7 定义、T8/T15/T16/T17 消费，字段名一致；`Board.at/set/pieces/copy/from_fen/to_fen` 在 T2 定义后被 T3/T4/T12/T13/T15/T16 一致使用；`BoardGeometry.cell_to_px/px_to_cell/with_offset/to_json/from_json/is_plausible` 在 T5 定义后被 T9/T11/T12/T13/T14/T17 一致使用；`TemplateSet.load/match`、`Recognition.board/confidence/unknown`、`GameRecorder.add/to_text/iccs_line/save`、`Session.state/board/last_analysis/message/step/pause/resume/request_stop/should_stop` 均单次定义、多处引用，无改名。
 
-**4. Review Focus**：RF-1（T9 测试）、RF-2（T9 `is_blank_frame` 三条测试 + T16 `test_全白帧不改变已确认局面`）、RF-3（T11 `test_大厅帧判定无棋盘`）、RF-4（T16 `test_轮到我方时局面不变_不进终局` 与 `test_非我方回合静止超时_进终局`）、RF-5（T9 `size_changed` + T18 Step 4 的重定位循环）。五项全部有测试落位。
+**4. Review Focus**：RF-1（T9 测试）、RF-2（T9 `is_blank_frame` 三条测试 + T16 `test_全白帧不改变已确认局面`）、RF-3（T11 `test_大厅帧判定无棋盘`）、RF-4（T16 `test_非我方回合静止超时_只暂停不终局`、`test_轮到我方时局面不变_暂停等人`、`test_默认不检查静止_对方想多久都等`）、RF-5（T9 `size_changed` + T18 Step 4 的重定位循环）。五项全部有测试落位。
 
 **5. 比例**：本计划约 900 行，spec 约 580 行，比例合理；代码块只出现在「测试断言」与「算法不确定处」（perft 规则、投影峰拟合、UCI 读取时序、绝对坐标归一化），未逐行转写实现。
