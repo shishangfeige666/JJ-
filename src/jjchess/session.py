@@ -39,14 +39,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from jjchess.config import Config
-from jjchess.geometry import RED, BoardGeometry, ScreenMapper
+from jjchess.geometry import BLACK, RED, BoardGeometry, ScreenMapper
+from jjchess.rules.board import START_FEN, Board
 from jjchess.rules.moves import legal_moves, make, parse_move
 
 if TYPE_CHECKING:  # pragma: no cover - 只为类型标注
     from jjchess.control import Mouse
     from jjchess.engine.uci import Analysis
     from jjchess.record import GameRecorder
-    from jjchess.rules.board import Board
 
 __all__ = [
     "BOARD_LOST_TIMEOUT_S",
@@ -103,8 +103,14 @@ MIN_MIDGAME_PIECES = 4
 #: 对局进行中也会偶发单帧读不到棋盘（真机日志里见过一次，下一帧就恢复）。
 #: 6 秒对这两种情况都太紧。代价只是终局晚 10 秒收摊，很划算。
 BOARD_LOST_TIMEOUT_S = 10.0
-#: 开局判定的棋子数下限（满盘 32 子，少几个也算，但大厅的空盘一定不够）。
-_MIN_OPENING_PIECES = 28
+#: 「盘上每一颗子都还在原始格」这个判据的子数下限。
+#:
+#: 判据本身是精确的：只要有一颗子离开了原始格就不成立（红方第一手的落点必然如此），
+#: 所以不需要「满盘」这么严的门槛。识别漏掉的格子（`unknown` 被当空处理）会被跳过，
+#: 真开局少认几颗子也照样成立 —— 这里只需要挡住大厅/装饰棋盘那种近乎空盘。
+_MIN_START_PIECES = 16
+#: 标准开局的网状快照，用来判断「棋是不是一步都还没走」（见 `_is_standard_start`）。
+_START_GRID = Board.from_fen(START_FEN).grid
 
 
 class State(str, Enum):
@@ -338,7 +344,7 @@ class Session:
         if cur is None:
             self._probe_reset()
             return
-        if _looks_like_opening(cur):
+        if _is_standard_start(cur):
             self._probe_reset()
             board = cur.copy()
             board.side = RED  # 象棋红先
@@ -349,9 +355,37 @@ class Session:
             self.message = "检测到开局局面"
             self.state = State.MY_TURN if self.my_side == RED else State.OPPONENT_TURN
             return
+        if self._adopt_opening_reply(cur):
+            return
         if self._probe_midgame(cur):
             return
         self.message = "等待对局开始…"
+
+    def _adopt_opening_reply(self, cur: Board) -> bool:
+        """执黑时红方的第一手已经落在盘上了 —— 当场接手，轮到我方走。
+
+        「执黑开局、敌方走完一手、我方一直不动」那个真机 bug（2026-11-04）的正解就在这里。
+        红方先手，所以「标准开局 + 恰好一步合法的红方着法」只可能意味着**红方刚走完
+        第一手**，此刻轮到我方（黑）。脚本启动得比红方第一手晚的时候就会撞上它。
+
+        判据用 `interpret` 精确比对（落点必须对上、整盘最多差 `tolerance_cells` 格），
+        和 `_is_standard_start` 互不重叠：那个认「一格都没动」，这个认「只动了一步」。
+        顺手把这一手记进记谱 —— 它确实走过，不能因为脚本晚启动就漏掉。
+
+        执红时不走这条路：红方那一手更可能是我方（或用户）自己下的，轮到谁说不准，
+        交给中盘接手去「看一会儿」。
+        """
+        if self.my_side != BLACK:
+            return False
+        start = Board.from_fen(START_FEN)
+        mv = interpret(start, cur, self.deps.config.tolerance_cells)
+        if mv is None:
+            return False
+        self._probe_reset()
+        self.board = start
+        self._adopt(mv, opponent=True)  # 记谱 + 把局面推到「红方走完，轮到黑方」
+        self.message = f"红方已经先走 {mv}，轮到我方"
+        return True
 
     def _probe_midgame(self, cur: Board) -> bool:
         """窗口里已经有一盘下到一半的棋时，接手它。返回 `True` 表示还在观察期。
@@ -721,21 +755,30 @@ class Session:
         return True
 
 
-def _looks_like_opening(board: Board) -> bool:
-    """棋子够多、双方将帅都在 —— 这才像一局棋，而不是大厅菜单。"""
-    values = board.grid
-    if int(np.count_nonzero(values)) < _MIN_OPENING_PIECES:
+def _is_standard_start(board: Board) -> bool:
+    """盘上每一颗子都还在自己的原始格 —— 这才是「一步都还没走」。
+
+    **绝不能只数子数**：红方第一手走完仍是 32 颗子，中盘接手的局面也常常 >= 28。
+    老判据（子数 >= 28 + 双方将帅都在）会把「红方已经走完一手」当成开局，于是
+    `_step_idle` 把那个局面直接存成模型、把 side 钉成红方 —— 执黑时这就是
+    「敌方走完一手，我方永远不动」（真机 `_probe/e2e/run_black2.log` 与 2026-11-04 复现）。
+
+    判据是精确的：`_START_GRID` 说这个格上有子，就得还是那颗子；哪个格上冒出了
+    `_START_GRID` 里没有的子，就一定动过（红方第一手的落点必然如此）。
+    识别漏掉的格子（`unknown` 被当空处理）会被忽略 —— 所以真开局少认几颗子照样成立，
+    `_MIN_START_PIECES` 只用来挡住大厅/装饰棋盘那种近乎空盘。
+    """
+    grid = board.grid
+    if int(np.count_nonzero(grid)) < _MIN_START_PIECES:
         return False
-    red_king = 1  # PIECE_CHARS 里的 K
-    black_king = -1
-    return bool((values == red_king).any() and (values == black_king).any())
+    return not bool(((grid != 0) & (grid != _START_GRID)).any())
 
 
 def _looks_like_midgame(board: Board) -> bool:
     """像一盘**下到一半**的棋：双方将帅都在，子数也够。
 
-    `_MIN_OPENING_PIECES` 是「子几乎没动过」的门槛，中盘当然达不到，
-    所以中盘只看「双方将帅都在 + 子数 >= `MIN_MIDGAME_PIECES`」。
+    `_is_standard_start` 管的是「一步都没走」，中盘当然不成立，所以这里只看
+    「双方将帅都在 + 子数 >= `MIN_MIDGAME_PIECES`」。
     装饰棋盘、大厅、结算画面要么是空的，要么认不出将帅，都会被挡掉。
     """
     values = board.grid

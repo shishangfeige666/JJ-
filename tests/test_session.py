@@ -21,7 +21,7 @@ import pytest
 from jjchess.config import DEFAULTS, Config
 from jjchess.control import Mouse
 from jjchess.engine.uci import Analysis
-from jjchess.geometry import RED, BoardGeometry, ScreenMapper
+from jjchess.geometry import BLACK, RED, BoardGeometry, ScreenMapper
 from jjchess.record import GameRecorder
 from jjchess.rules.board import START_FEN, Board
 from jjchess.rules.moves import legal_moves, make
@@ -768,6 +768,98 @@ def test_开局局面进入对局():
 
 def test_执黑时开局先等对方走():
     s = _make_session(State.IDLE, provider=_Provider(Board.from_fen(START_FEN)), my_side=-1)
+    s.step()
+    assert s.state is State.OPPONENT_TURN
+
+
+def _after_red_first_move(mv: str = "b0c2") -> Board:
+    """红方第一手走完的局面：还是 32 颗子，一颗都没少。"""
+    b = Board.from_fen(START_FEN)
+    make(b, mv)
+    return b
+
+
+def _black_recorder() -> GameRecorder:
+    return GameRecorder(-1, START_FEN, datetime.datetime(2026, 11, 4, 18, 1, 6))
+
+
+@pytest.mark.parametrize(
+    "red_move",
+    [
+        "b0c2",  # 马八进七（2026-11-04 18:01 那两局的其中一手）
+        "g0e2",  # 相三进五（2026-11-04 真机现场抓到的 `_probe/e2e/now_repro.png`）
+    ],
+)
+def test_执黑时红方已经先走了一手_直接轮到我方(red_move):
+    """真机 bug（2026-11-04）：脚本启动比红方第一手晚，盘上仍是 32 颗子。
+
+    老逻辑按「子数 >= 28 + 双方将帅都在」判开局，把这个**红方已经走完**的局面
+    当成开局存进模型、把 side 钉成红方 → 停在 OPPONENT_TURN 等红方走第二手，
+    实际轮到我方（黑）→ 棋盘再也不变，我方就一直不动（对方超时判负）。
+    """
+    rec = _black_recorder()
+    s = _make_session(
+        State.IDLE, provider=_Provider(_after_red_first_move(red_move)), my_side=-1, recorder=rec
+    )
+    s.step()
+    assert s.state is State.MY_TURN, "红方第一手已经落下，此刻轮到我方（黑）"
+    assert s.board is not None and s.board.side == BLACK
+    assert [m.iccs for m in rec.moves] == [red_move], "红方这一手要记进记谱，不能因为晚启动就漏掉"
+    assert rec.moves[0].side == RED
+
+
+def test_执黑接手红方第一手后能自己走第一步():
+    """接手之后必须真的替**我方（黑）**算棋、真的点出去，而不是替红方想。"""
+    engine = _FakeEngine("b9c7")  # 黑方马二进三
+    rec = _black_recorder()
+    s = _make_session(
+        State.IDLE,
+        provider=_Provider(_after_red_first_move()),
+        my_side=-1,
+        engine=engine,
+        recorder=rec,
+    )
+    _run_until(s, State.VERIFY)
+    assert s.deps.mouse.clicks, "轮到我方就该点出去"
+    assert engine.calls, "要问过引擎"
+    fen = engine.calls[0][0]
+    assert fen.split()[1] == "b", f"喂给引擎的局面必须是轮到黑方：{fen}"
+
+
+def test_执黑时中盘局面不会被当成开局():
+    """真机 `_probe/e2e/run_black2.log`：首帧就是 30 颗子的中盘，老逻辑照样打「检测到开局局面」。
+
+    中盘根本不知道轮到谁 —— 只能先盯一会儿（见 `_probe_midgame`），绝不能假设红先。
+    """
+    mid = Board.from_fen(
+        "2baka3/5n3/2c1b2c1/6p1p/p1p6/2P1PNP1P/nC1r5/3rB4/3N3R1/1RCAKAB2 w - - 0 1"
+    )
+    clock = _Clock()
+    s = _make_session(State.IDLE, provider=_Provider(mid), my_side=-1, clock=clock)
+
+    s.step()
+    assert s.state is State.IDLE, "不知道轮到谁，先看一会儿"
+    assert "一半" in s.message
+
+    clock.advance(MIDGAME_PROBE_S + 0.1)
+    s.step()
+    assert s.state is State.MY_TURN
+    assert s.board is not None and s.board.side == BLACK
+
+
+def test_动过一格的局面不算开局():
+    """红方先手走完仍是 32 颗子 —— 「子数够」不等于「还没开走」。"""
+    s = _make_session(State.IDLE, provider=_Provider(_after_red_first_move()))
+    s.step()
+    assert s.message != "检测到开局局面"
+    assert s.state is State.IDLE and "一半" in s.message
+
+
+def test_真开局少认一颗子仍算开局():
+    """识别漏掉的格子被当空处理，不能因此把开局判丢（否则会去乱接手）。"""
+    almost = Board.from_fen(START_FEN)
+    almost.grid[9, 0] = 0  # 红车认丢了一颗
+    s = _make_session(State.IDLE, provider=_Provider(almost), my_side=-1)
     s.step()
     assert s.state is State.OPPONENT_TURN
 

@@ -105,3 +105,49 @@ def test_真实开局帧能定位():
     assert g.dx == pytest.approx(154.57, abs=2)
     assert g.dy == pytest.approx(148.06, abs=2)
     assert g.cell_px == pytest.approx(125.85, abs=2)
+
+
+def test_棋盘外那条特别强的线不该抬高标准():
+    """棋盘外面（木框、侧栏）常有比网格线还强的边，不能拿它当「线强度」的基准。
+
+    原来是 `拟合线中位数 ÷ 全部候选里最强的那条`。真机 2026-11-04 实测：内线 619~1050
+    （中位数 685），候选里有一条 1575 的棋盘外竖线 —— 门槛 0.45×1575≈709，同一盘棋
+    只要棋子压住几段线，比值就从 0.65 掉到 0.44，`locate()` 于是翻脸说「没有棋盘」。
+    基准换成**拟合到的这些线自己的最大值**之后，棋盘外那条再强也不影响判断。
+    """
+    prof = np.zeros(400, np.float32)
+    for x in [10, 50, 90, 130, 170, 210, 250, 290, 330]:
+        prof[x] = 150
+    prof[130] = 130  # 被棋子压住一段，弱一点
+    prof[395] = 400  # 棋盘外的强边（真机上是木框）
+    assert np.allclose(find_lines(prof, 9), [10, 50, 90, 130, 170, 210, 250, 290, 330], atol=3)
+
+
+def test_拟到的线强弱悬殊时仍然拒绝():
+    """换掉基准不等于不设防：拟到的线里强弱差一大截，照样不当棋盘。"""
+    prof = np.zeros(400, np.float32)
+    for i, x in enumerate([10, 50, 90, 130, 170, 210, 250, 290, 330]):
+        prof[x] = 100 if i == 0 else 40
+    with pytest.raises(BoardNotFound):
+        find_lines(prof, 9)
+
+
+def test_棋子压住几段线的真机帧也能定位():
+    """2026-11-04 真机现场帧：`locate()` 曾在这里失败，把还在下的一局判成「棋盘消失」。
+
+    那一帧内线强度的中位数是 685，候选里最强的是棋盘外一条 1575 的竖线，门槛 709 ——
+    差 3% 就翻脸（`pre_live.png` 是同一盘棋更早的一帧，当时还能定位）。换掉基准之后，
+    这一帧定出来的几何与 `pre_live.png` 完全一致。
+
+    `weak_lines.png` 是从 `_probe/` 里挑出来改名的（`tests/fixtures/mid_*.png`
+    在 .gitignore 里，是滚动产物）。
+    """
+    path = FIXTURES / "weak_lines.png"
+    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert img is not None, f"缺少 {path}"
+    g = locate(img)
+    assert g.is_plausible()
+    assert g.origin[0] == pytest.approx(118.31, abs=3)
+    assert g.origin[1] == pytest.approx(629.30, abs=3)
+    assert g.dx == pytest.approx(150.38, abs=2)
+    assert g.dy == pytest.approx(143.60, abs=2)

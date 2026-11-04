@@ -104,6 +104,8 @@ _ASCII_TABLE: tuple[tuple[str, str], ...] = (
         "这一步好像没点上，重按一次（第",
         "click did not register, retrying #",
     ),
+    ("红方已经先走 ", "red already opened with "),
+    ("，轮到我方", ", our turn"),
     ("对方走 ", "opponent played "),
     ("已走 ", "played "),
     ("走 ", "played "),

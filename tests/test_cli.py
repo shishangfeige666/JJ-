@@ -673,6 +673,47 @@ def test_认出结算画面的再来一局按钮():
     assert not is_result_screen(blank)
 
 
+def test_棋盘还在不在看的是棋子而不是网格线(monkeypatch):
+    """复查「棋盘还在不在」时，认得出双方将帅就算还在 —— 哪怕 `locate()` 这一帧失败。
+
+    2026-11-04 真机踩的那一下：我方刚走完 `c6c5`，网格线拟合突然找不到（投影强度
+    中位数 685，门槛 0.45×1575≈709），脚本先把几何清掉、再定位又失败，十秒后把
+    **还在下的一局**判成「已经看不到棋盘了，判定对局结束」。复查改成先认一帧之后，
+    同样的画面只要将帅还认得出，就不算棋盘消失。
+    """
+    from jjchess.main import _board_on_screen
+
+    cfg = Config()
+    img = _load_fixture("mid_01.png")
+    geom = _FAKE_GEOM
+    mapper = ScreenMapper(BLACK)
+
+    def stub(board: Board | None, boom: bool = False):
+        def fake_recognize(*_a, **_k):
+            if boom:
+                raise RuntimeError("这一帧读不出来")
+            if board is None:
+                return None
+            return Recognition(board=board, confidence=np.full((10, 9), 0.9))
+
+        return fake_recognize
+
+    monkeypatch.setattr("jjchess.main.recognize", stub(Board.from_fen(START_FEN)))
+    assert _board_on_screen(img, geom, None, mapper, cfg), "将帅都在，棋盘就还在"
+
+    # 将帅认不出来（结算弹窗、大厅、切到别的页面）就不算还在，交回 `locate()` 判断。
+    empty = Board.from_fen(START_FEN)
+    empty.grid[:] = 0
+    monkeypatch.setattr("jjchess.main.recognize", stub(empty))
+    assert not _board_on_screen(img, geom, None, mapper, cfg)
+
+    monkeypatch.setattr("jjchess.main.recognize", stub(None))
+    assert not _board_on_screen(img, geom, None, mapper, cfg)
+
+    monkeypatch.setattr("jjchess.main.recognize", stub(None, boom=True))
+    assert not _board_on_screen(img, geom, None, mapper, cfg), "认崩了也不能当成棋盘还在"
+
+
 def _patch_round_loop(monkeypatch, geom, rec, tmp_path, extra: list[str]):
     """把主循环的一局做成「一帧有棋盘，然后一直认不到」的桩。"""
     ctl = {"give": 1, "grab": 0}

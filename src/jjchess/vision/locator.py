@@ -49,7 +49,7 @@ _MAX_REFIT = 3
 _MIN_SPAN_RATIO = 0.35
 #: 候选格距去重时的取整精度（px）。
 _SPACING_ROUND = 0.5
-#: 匹配到的峰强度中位数至少要达到峰值的这个比例，否则认为这些线不是贯穿棋盘的网格线。
+#: 拟合到的线「强弱是否均匀」：强度中位数至少要达到其中最强那条的这个比例。
 _MIN_FILL_RATIO = 0.45
 #: 棋子直径 / 格距。
 _CELL_PX_RATIO = 0.85
@@ -225,11 +225,19 @@ def find_lines(profile: np.ndarray, count: int) -> list[float]:
 
     # 覆盖数够了不代表就是棋盘：大厅菜单的卡片、聊天列表也有一堆近似等距的边。
     # 真棋盘线是**贯穿整个 ROI 的长线**，投影强度远高于这些噪声纹理，用中位数卡一道。
-    peak = max(strength for _, strength in cands)
-    median = statistics.median([s for s in fitted.matched if s > 0])
+    #
+    # 基准取**拟合到的这些线自己的最大强度**，不是「全部候选里最强的那一条」：候选里
+    # 常常混着棋盘外的东西（木框边、侧栏边），真机上它能有内线的 1.5 倍（实测 1575，
+    # 而内线只有 619~1050）。拿它当分母，同一盘棋只要棋子压住几段线就会从「找得到」
+    # 翻成「找不到」—— 2026-11-04 实测：内线中位数 685，门槛 0.45×1575≈709，就差 3%，
+    # 于是脚本把**还在下的一局**当成了「棋盘消失」。换成拟合线自己的最大值之后，同一
+    # 盘棋的比值是 0.65，噪声纹理仍在 0.5 上下 —— 真假之间的分界反而更清楚。
+    strengths = [s for s in fitted.matched if s > 0]
+    peak = max(strengths)
+    median = statistics.median(strengths)
     if median < _MIN_FILL_RATIO * peak:
         raise BoardNotFound(
-            f"候选线的投影强度中位数只有 {median:.0f}（最强候选线 {peak:.0f}），"
+            f"候选线的投影强度中位数只有 {median:.0f}（最强的一条线 {peak:.0f}），"
             f"这些线强弱悬殊，不像是贯穿棋盘的网格线；{_HINT}"
         )
 

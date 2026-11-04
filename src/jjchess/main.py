@@ -669,6 +669,33 @@ def _retry_unknown(img, geom, templates, mapper, cfg, rec):
     return rec
 
 
+def _board_on_screen(
+    img: np.ndarray,
+    geom: BoardGeometry,
+    templates,
+    mapper: ScreenMapper,
+    cfg: Config,
+) -> bool:
+    """画面里的棋盘还在不在 —— 先看棋子，再退回看网格线。
+
+    为什么要多这一道：`locate()` 的判据是网格线投影强度的中位数（`_MIN_FILL_RATIO`），
+    在这台机器上裕度只有几个百分点 —— 真机实测最强候选线 1575、门槛 0.45×1575≈709，
+    而棋盘内线的强度就在 669~782 之间。棋子压住哪几段线全看当时局面，于是同一盘棋
+    可能上一秒定位得到、下一秒就定位不到；只认 `locate()` 的话，一帧拟合抖动就能把
+    **还在下的一局**判成「棋盘消失」，十秒后 `GAME_OVER`（2026-11-04 真机踩过：我方
+    刚走完 `c6c5`，接着就「已经看不到棋盘了，判定对局结束」）。
+
+    所以先拿现有几何认一帧：双方将帅都在，这就还是那双活着的棋盘，网格线拟合抖一下
+    不算数。认不出来（结算画面、切到别的页面、窗口换了尺寸导致旧几何对不上）才回到
+    `locate()` 那条老路。
+    """
+    try:
+        rec = recognize(img, geom, templates, mapper, side_to_move=RED, conf_min=cfg.conf_min)
+    except Exception:  # noqa: BLE001 - 认不出来就当棋盘不在了，交给 locate 兜底
+        return False
+    return rec is not None and both_kings_present(rec.board)
+
+
 def is_result_screen(img) -> bool:
     """画面底部那个绿色的「再来一局」按钮在不在。
 
@@ -927,11 +954,15 @@ def _play(args: argparse.Namespace, cfg: Config, window, engine) -> int:
                 # 每 2 秒换一次的版本跑一分钟就撞上「点击后局面校验失败」）。
                 # 换几何只在一个明确信号下做 —— 见 `_retry_unknown`。
                 #
-                # 复查本身只花约 12ms。
+                # 复查**先看棋子、再退回看网格线**（见 `_board_on_screen`）：`locate()`
+                # 的判据是网格线投影强度的中位数，这台机器上裕度只有几个百分点
+                # （2026-11-04 实测最强候选线 1575、门槛 0.45×1575≈709，而内线强度就在
+                # 669~782 之间）—— 棋子压住哪几段线全看当时局面，同一盘棋可能上一秒
+                # 定位得到、下一秒就定位不到。只认 `locate()` 的话，一帧拟合抖动就能
+                # 把**还在下的一局**判成「棋盘消失」，十秒后 `GAME_OVER`（当天真机就踩
+                # 了：我方刚走完 c6c5，接着就「已经看不到棋盘了」）。
                 last_locate = now
-                try:
-                    locate(img)
-                except BoardNotFound:
+                if not _board_on_screen(img, geom, templates, mapper, cfg):
                     print("这一帧找不到棋盘，先当作棋盘已消失…", file=sys.stderr)
                     geom = None
             if geom is None:
